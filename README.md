@@ -1,93 +1,108 @@
-# Meijo Task Hub (MTH) - 技術仕様書 (v1.2)
+# Meijo Task Hub (MTH) - 技術仕様書 (v1.8)
 
 ## 1. プロジェクト概要
-名城大学の LMS (WebClass) と Google Classroom の課題情報を統合し、手動タスク管理および Google カレンダーへの同期を実現するブラウザ拡張機能。
-**「ID/パスワードを保持せず、既存セッションで自動巡回を完遂する」**ことをコアバリューとする。
+名城大学 WebClass と Google Classroom の課題情報を統合し、カレンダー同期とタスク管理を実現する拡張機能。既存セッションを維持したまま、実機検証済みのロジックで自動巡回を行う。
 
 ## 2. ターゲット環境
-- **対象サイト**: `https://rpwebcls.meijo-u.ac.jp/webclass/*`
-- **開発基盤**: Vite + React + TypeScript + CRXJS (Manifest V3)
-- **外部連携**: Google Classroom API, Google Calendar API (OAuth 2.0)
+- 対象: https://rpwebcls.meijo-u.ac.jp/webclass/*
+- 基盤: Vite + React + TypeScript + CRXJS (Manifest V3)
 
 ---
 
-## 3. 実証済みデータ抽出ロジック (Verified)
+## 3. 実証済み抽出ロジック (Verified Logic)
 
-### 3.1 巡回アルゴリズム
-メインページの `table a` から全教科 URL を取得し、URL ベースで重複排除。
+### 3.1 巡回・正規化 (抽出確認済み)
+1. 教科抽出: メインページ table a からリンク収集、URLで重複排除。
+2. 教科名正規化: ハッシュ生成前に /\s*\(20\d{2}-.*?\)$/ で年度・時限を除去。
 
-### 3.2 粘着型抽出ロジック (抽出確認済み)
-WebClass の動的生成・低速応答に対応するため、以下の処理を実装。
-- **ポーリング監視**: `.cl-contentsList_content` が出現するまで最大 15 秒間、500ms 間隔で監視。
-- **タイムアウト処理**: 15 秒経過時は「教材なし」として正常終了（ループ停止を防止）。
-- **抽出規則**: 
-  - **タイトル**: `innerText` を改行分割し、不要語（`New`, `詳細`, `利用可能期間` 等）を除外した有効な 1 行目。
-  - **締切**: 正規表現 `\d{4}\/\d{2}\/\d{2}.*?\d{2}:\d{2}` でマッチする**最後**の日時。
+### 3.2 動的解析と待機処理 (抽出確認済み)
+- 動的待機: .cl-contentsList_content 出現まで最大15秒、500ms毎に監視。
+- 区分判定: innerText から優先順にキーワード抽出（試験 > レポート > 演習 > 資料）。
+- 締切取得: 正規表現 \d{4}\/\d{2}\/\d{2}.*?\d{2}:\d{2} の最後の一致を採用。
+
+### 3.3 決定論的ID生成
+- 方式: SHA-256(normalizeCourseName + title + deadline)
+- 実装: crypto.subtle.digest を使い、先頭16文字を採用。
 
 ---
 
-## 4. 機能要件 (Functional Requirements)
-
-### 4.1 セッション利用型・自動巡回
-- **認証**: ID/パスワードは DB に保存せず、ブラウザの Cookie を利用。
-- **実行環境**: `background.ts` (Service Worker) での Fetch。
-- **負荷分散**: 教科間 Fetch に `1000ms` 以上の待機を設定。
-
-### 4.2 統合タスク管理
-- **ソース混合**: WebClass、Classroom、および**手動追加タスク**を単一リストに統合。
-- **手動追加**: サイドバーから「タイトル」「締切」を任意入力・保存可能。
-- **永続化**: `chrome.storage.local` を使用。
-
-### 4.3 Google カレンダー同期
-- **OAuth 認証**: `chrome.identity` によるトークン取得。
-- **不整合防止**: 課題ハッシュを `extendedProperties` に付与し、重複登録を防止。
+## 4. 機能要件 (Manual-First Policy)
+- 自動判定: レポート提出数 > 0 等を確認。
+- 手動管理: ユーザーのチェック操作を completedIds (storage.local) に永続化し、スキャン結果より優先してマージ。
 
 ---
 
 ## 5. データ構造定義 (TypeScript)
-
 ```typescript
-type TaskSource = 'WebClass' | 'Classroom' | 'Manual';
+type TaskType = '試験' | 'レポート' | '演習' | '資料' | 'その他';
 
 interface UnifiedTask {
-  readonly id: string;           // URLハッシュまたはUUID
-  readonly source: TaskSource;
-  readonly courseName: string;   // 手動の場合は「個人」等
-  title: string;                 // 課題名
-  endAt: string | null;          // 締切日時 (ISO8601)
-  link?: string;                 // WebClassへの直リンク
-  isCompleted: boolean;          // 完了フラグ
-  isSyncedToCalendar: boolean;   // カレンダー登録済みフラグ
-  lastUpdatedAt: number;
+  readonly id: string;           // 検証済み SHA-256 ID
+  readonly source: 'WebClass' | 'Classroom' | 'Manual';
+  readonly courseName: string;   // 正規化済み教科名
+  title: string;
+  type: TaskType;
+  endAt: string | null;          // ISO8601
+  link?: string;
+  isCompleted: boolean;          // 手動・自動マージ後
+}
+
+interface StorageSchema {
+  tasks: UnifiedTask[];
+  completedIds: string[];        // 完了済みID配列
+  lastScanAt: number;
 }
 ```
-
 ---
 
-## 6. 実装ロードマップ
+## 6. 実装フェーズ詳細コード (Implementation Blueprint)
 
-### Phase 1: 巡回エンジンの移植
-- [ ] `manifest.json` の設定（`cookies`, `identity`, `host_permissions`）
-- [ ] 検証済み iframe ロジックを `background.ts` 用の Fetch 処理へ昇華。
+### 6.1 核心ロジックの参照実装
+```
+// src/utils/crypto.ts: ID生成
+export const generateId = async (course: string, title: string, deadline: string): Promise<string> => {
+  const seed = `${course.trim()}_${title.trim()}_${deadline || 'none'}`;
+  const msgUint8 = new TextEncoder().encode(seed);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+};
 
-### Phase 2: サイドバー UI & 手動追加
-- [ ] React + Tailwind によるサイドバー描画。
-- [ ] `chrome.storage` を介した手動タスクの CRUD 操作。
-
-### Phase 3: カレンダー連携
-- [ ] Google Cloud Console での API 有効化。
-- [ ] `events.insert` を用いた同期ロジック実装。
-
+// src/utils/scanner.ts: 区分判定
+export const classifyType = (text: string): TaskType => {
+  if (text.includes('試験')) return '試験';
+  if (text.includes('レポート')) return 'レポート';
+  if (text.includes('演習')) return '演習';
+  if (text.includes('資料')) return '資料';
+  return 'その他';
+};
+```
 ---
 
 ## 7. 開発開始用コマンド
-```bash
-# プロジェクト作成
-npm create vite@latest meijo-task-hub -- --template react-ts
 
-# 依存ライブラリのインストール
-# @crxjs/vite-plugin: 拡張機能開発に必須
-# lucide-react: アイコン素材
-# dayjs: 日付操作
+### 7.1 環境構築
+# 1. プロジェクト作成
+```
+npm create vite@latest meijo-task-hub -- --template react-ts
+cd meijo-task-hub
+```
+# 2. 依存関係
+```
 npm install @crxjs/vite-plugin@latest lucide-react dayjs -D
+```
+# 3. CSS
+```
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+```
+### 7.2 Manifest V3 構成テンプレート
+```
+{
+  "manifest_version": 3,
+  "name": "Meijo Task Hub",
+  "version": "1.0.0",
+  "permissions": ["storage", "cookies", "identity", "alarms", "offscreen"],
+  "host_permissions": ["https://rpwebcls.meijo-u.ac.jp/*"],
+  "background": { "service_worker": "src/background.ts", "type": "module" }
+}
 ```
