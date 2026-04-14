@@ -1,23 +1,23 @@
 {
-  "manifest_version": 3,
-  "name": "Meijo Task Hub",
-  "version": "1.0.0",
-  "action": { "default_popup": "index.html" },
-  "permissions": ["storage", "identity", "alarms"],
-  "host_permissions": [
-    "https://rpwebcls.meijo-u.ac.jp/webclass/*"
-  ],
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'"
-  },
-  "background": {
-    "service_worker": "src/background.ts",
-    "type": "module"
-  },
-  "content_scripts": [
+    "manifest_version": 3,
+    "name": "Meijo Task Hub",
+    "version": "1.0.0",
+    "action": { "default_popup": "index.html" },
+    "permissions": ["storage", "identity", "alarms"],
+    "host_permissions": [
+        "https://rpwebcls.meijo-u.ac.jp/webclass/*"
+    ],
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'self'"
+    },
+    "background": {
+        "service_worker": "src/background.ts",
+        "type": "module"
+    },
+    "content_scripts": [
     {
-      "matches": ["https://rpwebcls.meijo-u.ac.jp/webclass/*"],
-      "js": ["src/content.tsx"]
+        "matches": ["https://rpwebcls.meijo-u.ac.jp/webclass/*"],
+        "js": ["src/content.tsx"]
     }
-  ]
+    ]
 }
