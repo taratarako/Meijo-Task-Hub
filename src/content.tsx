@@ -17,6 +17,8 @@ const DATE_TOKEN_REGEX = /(\d{4})\/(\d{1,2})\/(\d{1,2})(?:[^\d]+(\d{1,2}):(\d{2}
 const PANEL_ID = "meijo-task-hub-panel";
 const AUTO_SYNC_COOLDOWN_MS = 60 * 60 * 1000;
 const LAST_AUTO_SYNC_AT_KEY = "mth-last-auto-sync-at";
+const TASK_INCLUDE_KEYWORDS = ["課題", "提出", "レポート", "演習", "小テスト", "テスト", "quiz", "assignment"];
+const TASK_EXCLUDE_KEYWORDS = ["お知らせ", "連絡", "資料", "教材", "案内", "出席", "時間割", "成績", "アンケート", "掲示"];
 
 let syncing = false;
 let lastTasks: ExtractedTask[] = [];
@@ -217,6 +219,29 @@ const resolveTitle = (element: Element): string => {
   return uniqueCandidates[0];
 };
 
+const isLikelyTaskItem = (element: Element): boolean => {
+  const text = (element.textContent || "").replace(/\s+/g, " ").toLowerCase();
+  const anchorHref = (element.querySelector("a[href]") as HTMLAnchorElement | null)?.href.toLowerCase() || "";
+  const targetText = `${text} ${anchorHref}`;
+
+  if (!targetText.trim()) return false;
+
+  if (TASK_EXCLUDE_KEYWORDS.some((keyword) => targetText.includes(keyword.toLowerCase()))) {
+    return false;
+  }
+
+  if (TASK_INCLUDE_KEYWORDS.some((keyword) => targetText.includes(keyword.toLowerCase()))) {
+    return true;
+  }
+
+  // 課題語がなくても、締切表記がある項目は課題候補として扱う。
+  if (/(締切|提出期限|期限|due)/i.test(targetText)) {
+    return true;
+  }
+
+  return false;
+};
+
 const formatDueLabel = (task: ExtractedTask): string => {
   if (!task.endAtMs) return "期限なし";
   const due = new Date(task.endAtMs);
@@ -407,7 +432,9 @@ const extractCourseTasks = (
       clearInterval(checkInterval);
       clearTimeout(timeout);
 
-      const tasks: ExtractedTask[] = Array.from(elements).map((el) => {
+      const filteredElements = Array.from(elements).filter((el) => isLikelyTaskItem(el));
+
+      const tasks: ExtractedTask[] = filteredElements.map((el) => {
         const text = el.textContent?.trim() || "";
         const title = resolveTitle(el);
 
@@ -435,6 +462,8 @@ const extractCourseTasks = (
           source: "WebClass_AutoSync",
         };
       });
+
+      console.log(`📌 [${courseName}] 一覧${elements.length}件 / 課題抽出${tasks.length}件`);
 
       if (document.body.contains(iframe)) document.body.removeChild(iframe);
       resolve(tasks);
