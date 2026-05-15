@@ -220,8 +220,8 @@ const renderTasks = (tasks: ExtractedTask[]) => {
   const renderSection = (title: string, items: ExtractedTask[], accent: string) => {
     if (items.length === 0) return "";
     const cards = items.map((task) => `
-        <article style="background:#0f3568;border:1px solid rgba(255,255,255,0.14);border-left:4px solid ${accent};border-radius:10px;padding:10px 10px 9px;margin-bottom:8px;position:relative;">
-          <button class="mth-delete-btn" data-task-key="${task.taskKey}" style="position:absolute;top:4px;right:4px;border:none;border-radius:8px;padding:8px 14px;background:rgba(255,255,255,0.15);color:#f5f7fa;font-size:12px;cursor:pointer;">削除</button>
+        <article style="background:#0f3568;border:1px solid rgba(255,255,255,0.14);border-left:4px solid ${accent};border-radius:10px;padding:10px 64px 9px 10px;margin-bottom:8px;position:relative;">
+          <button class="mth-delete-btn" data-task-key="${task.taskKey}" style="position:absolute;top:8px;right:8px;border:none;border-radius:6px;padding:6px 12px;background:rgba(255,255,255,0.15);color:#f5f7fa;font-size:12px;cursor:pointer;z-index:2;line-height:1;">削除</button>
           <div style="font-size:12px;opacity:0.92;margin-bottom:6px;">${task.course}</div>
           <div style="font-size:16px;line-height:1.35;font-weight:700;margin-bottom:8px;">${task.title}</div>
           <div style="font-size:13px;">締切: <strong>${formatDueLabel(task)}</strong>${isOverdue(task) ? ' <span style="margin-left:6px;color:#ffb3a8;">(期限切れ)</span>' : ""}</div>
