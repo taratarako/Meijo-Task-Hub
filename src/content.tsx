@@ -16,6 +16,11 @@ type ExtractedTask = {
   hiddenAt?: number | null;
 };
 
+type Calendar = {
+  id: string;
+  summary: string;
+};
+
 const DATE_TOKEN_REGEX = /(\d{4})\/(\d{1,2})\/(\d{1,2})(?:[^\d]+(\d{1,2}):(\d{2}))?/g;
 const PANEL_ID = "meijo-task-hub-panel";
 const AUTO_SYNC_COOLDOWN_MS = 60 * 60 * 1000;
@@ -28,6 +33,8 @@ let lastTasks: ExtractedTask[] = [];
 let routeWatcherStarted = false;
 let lastObservedHref = location.href;
 let wasOnTimetablePage = false;
+let selectedCalendarId: string | null = null;
+let availableCalendars: Calendar[] = [];
 
 const extensionChrome = (globalThis as typeof globalThis & {
   chrome?: {
@@ -222,6 +229,7 @@ const renderTasks = (tasks: ExtractedTask[]) => {
     const cards = items.map((task) => `
         <article style="background:#0f3568;border:1px solid rgba(255,255,255,0.14);border-left:4px solid ${accent};border-radius:10px;padding:10px 64px 9px 10px;margin-bottom:8px;position:relative;">
           <button class="mth-delete-btn" data-task-key="${task.taskKey}" style="position:absolute;top:8px;right:8px;border:none;border-radius:6px;padding:6px 12px;background:rgba(255,255,255,0.15);color:#f5f7fa;font-size:12px;cursor:pointer;z-index:2;line-height:1;">削除</button>
+          <button class="mth-calendar-add-btn" data-task-key="${task.taskKey}" style="position:absolute;top:32px;right:8px;border:none;border-radius:6px;padding:6px 12px;background:rgba(111,224,177,0.3);color:#6fe0b1;font-size:11px;cursor:pointer;z-index:2;line-height:1;${task.endAtMs === null ? 'opacity:0.5;cursor:not-allowed;' : ''}">📅追加</button>
           <div style="font-size:12px;opacity:0.92;margin-bottom:6px;">${task.course}</div>
           <div style="font-size:16px;line-height:1.35;font-weight:700;margin-bottom:8px;">${task.title}</div>
           <div style="font-size:13px;">締切: <strong>${formatDueLabel(task)}</strong>${isOverdue(task) ? ' <span style="margin-left:6px;color:#ffb3a8;">(期限切れ)</span>' : ""}</div>
@@ -245,6 +253,20 @@ const renderTasks = (tasks: ExtractedTask[]) => {
       if (!window.confirm(`課題「${target.title}」をリストから削除しますか？\n（※元のシステムからは削除されません）`)) return;
       await handleDeleteTask(target);
     });
+  });
+  const calendarAddButtons = listEl.querySelectorAll<HTMLButtonElement>(".mth-calendar-add-btn");
+  calendarAddButtons.forEach((button) => {
+    if (button.dataset.taskKey) {
+      const task = tasks.find((t) => t.taskKey === button.dataset.taskKey);
+      if (!task || task.endAtMs === null) {
+        button.disabled = true;
+        return;
+      }
+      button.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        await addTaskToCalendar(task);
+      });
+    }
   });
 };
 
@@ -296,6 +318,110 @@ const isOverdue = (task: ExtractedTask): boolean => {
   return task.endAtMs < Date.now();
 };
 
+const fetchCalendars = async (): Promise<void> => {
+  if (!extensionChrome?.runtime?.sendMessage) return;
+  try {
+    const res = await new Promise<{ ok?: boolean; calendars?: Calendar[] } | undefined>(r =>
+      extensionChrome?.runtime?.sendMessage?.(
+        { type: "mth-get-calendars", interactive: true },
+        (response) => r(response as { ok?: boolean; calendars?: Calendar[] } | undefined)
+      )
+    );
+    if (res?.ok && res.calendars) {
+      availableCalendars = res.calendars;
+      if (availableCalendars.length > 0 && !selectedCalendarId) {
+        selectedCalendarId = availableCalendars[0].id;
+      }
+    }
+  } catch { void 0; }
+};
+
+const addTaskToCalendar = async (task: ExtractedTask): Promise<void> => {
+  if (!selectedCalendarId || !extensionChrome?.runtime?.sendMessage) return;
+  if (!task.endAtMs) {
+    alert("締切がない課題はカレンダーに追加できません");
+    return;
+  }
+
+  try {
+    const res = await new Promise<{ ok?: boolean; message?: string } | undefined>(r =>
+      extensionChrome?.runtime?.sendMessage?.(
+        {
+          type: "mth-add-calendar-event",
+          calendarId: selectedCalendarId,
+          task: {
+            taskKey: task.taskKey,
+            title: task.title,
+            endAtMs: task.endAtMs,
+            course: task.course,
+            taskUrl: task.taskUrl,
+          },
+          interactive: true,
+        },
+        (response) => r(response as { ok?: boolean; message?: string } | undefined)
+      )
+    );
+    if (res?.ok) {
+      alert(`✓ カレンダーに追加しました: ${task.title}`);
+    } else {
+      alert(`⚠ ${res?.message || "カレンダーへの追加に失敗しました"}`);
+    }
+  } catch (e) {
+    alert("⚠ カレンダーへの追加に失敗しました");
+  }
+};
+
+const addAllTasksToCalendar = async (): Promise<void> => {
+  if (!selectedCalendarId) {
+    alert("カレンダーを選択してください");
+    return;
+  }
+
+  const now = Date.now();
+  const tasksToAdd = lastTasks.filter((task) => {
+    if (task.hidden) return false;
+    if (typeof task.endAtMs === "number" && task.endAtMs < now) return false;
+    if (task.endAtMs === null) return false;
+    return true;
+  });
+
+  if (tasksToAdd.length === 0) {
+    alert("追加可能な課題がありません");
+    return;
+  }
+
+  const panel = ensurePanel();
+  const bulkBtn = panel.querySelector<HTMLButtonElement>("#mth-bulk-add-btn");
+  if (bulkBtn) bulkBtn.disabled = true;
+
+  let added = 0;
+  for (const task of tasksToAdd) {
+    try {
+      const res = await new Promise<{ ok?: boolean; message?: string } | undefined>(r =>
+        extensionChrome?.runtime?.sendMessage?.(
+          {
+            type: "mth-add-calendar-event",
+            calendarId: selectedCalendarId,
+            task: {
+              taskKey: task.taskKey,
+              title: task.title,
+              endAtMs: task.endAtMs,
+              course: task.course,
+              taskUrl: task.taskUrl,
+            },
+            interactive: false,
+          },
+          (response) => r(response as { ok?: boolean; message?: string } | undefined)
+        )
+      );
+      if (res?.ok) added += 1;
+    } catch { void 0; }
+  }
+
+  if (bulkBtn) bulkBtn.disabled = false;
+  alert(`${added}/${tasksToAdd.length} 件の課題をカレンダーに追加しました`);
+};
+
 const ensurePanel = () => {
   let panel = document.getElementById(PANEL_ID);
   if (panel) return panel;
@@ -311,6 +437,12 @@ const ensurePanel = () => {
       <div style="display:flex;align-items:center;gap:8px;"><button id="mth-sync-btn" style="cursor:pointer;border:none;border-radius:8px;padding:8px 10px;background:#ffd44d;color:#3a2b00;font-weight:700;margin-right:8px;">再同期</button></div>
     </div>
     <div id="mth-count-container" style="padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.15);font-size:13px;">取得件数: <span id="mth-count" style="font-weight:700;">0</span></div>
+    <div id="mth-calendar-container" style="padding:8px 14px;border-bottom:1px solid rgba(255,255,255,0.15);display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      <select id="mth-calendar-select" style="flex:1;min-width:120px;border:none;border-radius:4px;padding:6px 8px;background:#0a1e3f;color:#f5f7fa;font-size:12px;cursor:pointer;border:1px solid rgba(255,255,255,0.2);">
+        <option value="">カレンダーを選択</option>
+      </select>
+      <button id="mth-bulk-add-btn" style="border:none;border-radius:4px;padding:6px 10px;background:rgba(111,224,177,0.4);color:#6fe0b1;font-size:11px;cursor:pointer;font-weight:700;">一括追加</button>
+    </div>
     <div id="mth-list" style="padding:10px 12px;overflow:auto;max-height:56vh;"></div>
   `;
   document.body.appendChild(panel);
@@ -325,16 +457,19 @@ const ensurePanel = () => {
     panel.appendChild(toggleBtn);
   }
   const countContainer = panel.querySelector<HTMLElement>("#mth-count-container");
+  const calendarContainer = panel.querySelector<HTMLElement>("#mth-calendar-container");
   const listEl = panel.querySelector<HTMLElement>("#mth-list");
   const applyMinimized = (min: boolean) => {
     if (min) {
       if (countContainer) countContainer.style.display = "none";
+      if (calendarContainer) calendarContainer.style.display = "none";
       if (listEl) listEl.style.display = "none";
       panel.style.maxHeight = "48px";
       if (toggleBtn) toggleBtn.textContent = "▢";
       if (syncButton) syncButton.style.display = "none";
     } else {
       if (countContainer) countContainer.style.display = "";
+      if (calendarContainer) calendarContainer.style.display = "";
       if (listEl) listEl.style.display = "";
       panel.style.maxHeight = "80vh";
       if (toggleBtn) toggleBtn.textContent = "—";
@@ -388,6 +523,35 @@ const ensurePanel = () => {
     else if (left) { panel.style.left = left; panel.style.right = ""; }
     else { panel.style.right = "16px"; }
   } catch { void 0; }
+
+  // カレンダー選択と一括追加ボタンの初期化
+  const calendarSelect = panel.querySelector<HTMLSelectElement>("#mth-calendar-select");
+  const bulkAddBtn = panel.querySelector<HTMLButtonElement>("#mth-bulk-add-btn");
+
+  if (calendarSelect) {
+    calendarSelect.addEventListener("change", (e) => {
+      selectedCalendarId = (e.target as HTMLSelectElement).value || null;
+    });
+  }
+
+  if (bulkAddBtn) {
+    bulkAddBtn.addEventListener("click", () => {
+      void addAllTasksToCalendar();
+    });
+  }
+
+  // カレンダー一覧を取得して初期化
+  void (async () => {
+    await fetchCalendars();
+    if (calendarSelect && availableCalendars.length > 0) {
+      calendarSelect.innerHTML = '<option value="">カレンダーを選択</option>' +
+        availableCalendars.map((cal) => `<option value="${cal.id}">${cal.summary}</option>`).join("");
+      if (selectedCalendarId) {
+        calendarSelect.value = selectedCalendarId;
+      }
+    }
+  })();
+
   return panel;
 };
 
