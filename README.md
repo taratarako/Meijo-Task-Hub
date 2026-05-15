@@ -127,47 +127,47 @@ FR-07 カレンダー連携:
 ### 8.1 コレクション設計
 
 users/{uid}
-	profile
-		- displayName: string
-		- email: string
-		- university: string
-		- createdAt: timestamp
-		- updatedAt: timestamp
+  profile
+    - displayName: string
+    - email: string
+    - university: string
+    - createdAt: timestamp
+    - updatedAt: timestamp
 
 users/{uid}/tasks/{taskKey}
-	- taskKey: string
-	- source: string                    # WebClass | GoogleClassroom | Manual
-	- courseId: string | null
-	- taskId: string | null
-	- courseName: string
-	- title: string
-	- description: string | null
-	- taskUrl: string | null
-	- endAt: timestamp
-	- isCompleted: boolean
-	- isOverdue: boolean
-	- calendarSynced: boolean
-	- calendarEventId: string | null
-	- lastSyncAt: timestamp
-	- createdAt: timestamp
-	- updatedAt: timestamp
+  - taskKey: string
+  - source: string                    # WebClass | GoogleClassroom | Manual
+  - courseId: string | null
+  - taskId: string | null
+  - courseName: string
+  - title: string
+  - description: string | null
+  - taskUrl: string | null
+  - endAt: timestamp
+  - isCompleted: boolean
+  - isOverdue: boolean
+  - calendarSynced: boolean
+  - calendarEventId: string | null
+  - lastSyncAt: timestamp
+  - createdAt: timestamp
+  - updatedAt: timestamp
 
 users/{uid}/syncLogs/{logId}
-	- startedAt: timestamp
-	- finishedAt: timestamp
-	- status: string                    # success | partial | failed
-	- scannedCourses: number
-	- upsertedTasks: number
-	- skippedOverdue: number
-	- errorCount: number
-	- errors: array<string>
+  - startedAt: timestamp
+  - finishedAt: timestamp
+  - status: string                    # success | partial | failed
+  - scannedCourses: number
+  - upsertedTasks: number
+  - skippedOverdue: number
+  - errorCount: number
+  - errors: array<string>
 
 ### 8.2 インデックス要件
 
 - users/{uid}/tasks:
-	- source ASC, endAt ASC
-	- isCompleted ASC, endAt ASC
-	- courseName ASC, endAt ASC
+  - source ASC, endAt ASC
+  - isCompleted ASC, endAt ASC
+  - courseName ASC, endAt ASC
 
 ### 8.3 データ整合ルール
 
@@ -218,6 +218,20 @@ users/{uid}/syncLogs/{logId}
 - identity
 - alarms
 - host_permissions: https://rpwebcls.meijo-u.ac.jp/webclass/*
+  - Google Classroom API を使うため、以下も追加
+    - https://classroom.googleapis.com/*
+    - https://www.googleapis.com/*
+
+### 12.1.1 Google Classroom OAuth
+
+manifest.json の oauth2.client_id は固定せず、ビルド時に環境変数から注入する。
+scopes は classroom.courses.readonly と classroom.coursework.me.readonly を設定する。
+
+環境変数:
+- MTH_GOOGLE_OAUTH_CLIENT_ID
+
+開発時は .env.local、本番ビルド時は .env.production に設定する。
+テンプレートは .env.example を参照。
 
 ### 12.2 環境変数
 
@@ -289,17 +303,3 @@ P2:
 - 主キーは現状 courseName + title 中心
 - background の本格利用は未着手
 
-## 17. AI 実装ガイド
-
-この章は、AI に実装依頼するときの最小指示セットです。
-
-必須順序:
-1. 認証導入 (FR-05)
-2. DB スキーマ移行 (第8章)
-3. 同期ロジック改修 (第7章)
-4. ダッシュボード UI (第6章 FR-06)
-5. Calendar 連携 (第11章)
-
-完了条件:
-- 受け入れ基準 AC-01 から AC-07 を満たす
-- E2E 手順で手動同期と個別カレンダー追加が再現できる
