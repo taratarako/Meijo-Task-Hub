@@ -208,18 +208,19 @@ const renderTasks = (tasks: ExtractedTask[]) => {
   const listEl = panel.querySelector<HTMLElement>("#mth-list");
   if (!listEl) return;
   const now = Date.now();
+  const sortByDue = (a: ExtractedTask, b: ExtractedTask) => {
+    if (a.endAtMs === null && b.endAtMs === null) return a.title.localeCompare(b.title, "ja");
+    if (a.endAtMs === null) return 1;
+    if (b.endAtMs === null) return -1;
+    if (a.endAtMs !== b.endAtMs) return a.endAtMs - b.endAtMs;
+    return a.title.localeCompare(b.title, "ja");
+  };
   const visibleTasks = tasks.filter((task) => {
     if (task.hidden) return false;
     if (typeof task.endAtMs === "number" && task.endAtMs < now) return false;
     return true;
   });
-  const sorted = visibleTasks.sort((a, b) => {
-    if (a.endAtMs === null && b.endAtMs === null) return 0;
-    if (a.endAtMs === null) return 1;
-    if (b.endAtMs === null) return -1;
-    return a.endAtMs - b.endAtMs;
-  });
-  if (sorted.length === 0) {
+  if (visibleTasks.length === 0) {
     listEl.innerHTML = '<div style="background:#0f3568;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:12px;font-size:13px;">表示できる課題がありません</div>';
     updateCount(0);
     return;
@@ -237,11 +238,11 @@ const renderTasks = (tasks: ExtractedTask[]) => {
       `).join("");
     return `<div style="margin-bottom:12px;"><div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#b7c9e2;margin-bottom:6px;">${title}</div>${cards}</div>`;
   };
-  const webclassTasks = sorted.filter((task) => task.source === "WebClass_AutoSync");
-  const googleTasks = sorted.filter((task) => task.source === "GoogleClassroom");
+  const webclassTasks = visibleTasks.filter((task) => task.source === "WebClass_AutoSync").sort(sortByDue);
+  const googleTasks = visibleTasks.filter((task) => task.source === "GoogleClassroom").sort(sortByDue);
   const html = renderSection("WebClass", webclassTasks, "#ffd44d") + renderSection("Google Classroom", googleTasks, "#6fe0b1");
   listEl.innerHTML = html;
-  updateCount(sorted.length);
+  updateCount(webclassTasks.length + googleTasks.length);
   const deleteButtons = listEl.querySelectorAll<HTMLButtonElement>(".mth-delete-btn");
   deleteButtons.forEach((button) => {
     button.addEventListener("click", async (event) => {
@@ -366,7 +367,7 @@ const addTaskToCalendar = async (task: ExtractedTask): Promise<void> => {
     } else {
       alert(`⚠ ${res?.message || "カレンダーへの追加に失敗しました"}`);
     }
-  } catch (e) {
+  } catch{
     alert("⚠ カレンダーへの追加に失敗しました");
   }
 };
@@ -431,8 +432,8 @@ const ensurePanel = () => {
   panel.innerHTML = `
     <div class="mth-header" style="padding:12px 14px;padding-right:56px;border-bottom:1px solid rgba(255,255,255,0.15);display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:grab;">
       <div style="display:flex;flex-direction:column;min-width:0;flex:1;">
-        <div style="font-weight:700;font-size:20px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">統一タスクダッシュボード</div>
-        <div id="mth-status" style="font-size:12px;opacity:0.9;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">初期化中...</div>
+        <div style="font-weight:700;font-size:20px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">TASKS</div>
+        <div id="mth-status" style="font-size:12px;opacity:0.9;margin-top:4px;white-space:pre-line;">初期化中...</div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;"><button id="mth-sync-btn" style="cursor:pointer;border:none;border-radius:8px;padding:8px 10px;background:#ffd44d;color:#3a2b00;font-weight:700;margin-right:8px;">再同期</button></div>
     </div>
@@ -459,11 +460,13 @@ const ensurePanel = () => {
   const countContainer = panel.querySelector<HTMLElement>("#mth-count-container");
   const calendarContainer = panel.querySelector<HTMLElement>("#mth-calendar-container");
   const listEl = panel.querySelector<HTMLElement>("#mth-list");
+  const statusEl = panel.querySelector<HTMLElement>("#mth-status");
   const applyMinimized = (min: boolean) => {
     if (min) {
       if (countContainer) countContainer.style.display = "none";
       if (calendarContainer) calendarContainer.style.display = "none";
       if (listEl) listEl.style.display = "none";
+      if (statusEl) statusEl.style.display = "none";
       panel.style.maxHeight = "48px";
       if (toggleBtn) toggleBtn.textContent = "▢";
       if (syncButton) syncButton.style.display = "none";
@@ -471,6 +474,7 @@ const ensurePanel = () => {
       if (countContainer) countContainer.style.display = "";
       if (calendarContainer) calendarContainer.style.display = "";
       if (listEl) listEl.style.display = "";
+      if (statusEl) statusEl.style.display = "";
       panel.style.maxHeight = "80vh";
       if (toggleBtn) toggleBtn.textContent = "—";
       if (syncButton) syncButton.style.display = "";
@@ -656,7 +660,7 @@ const startAutoSync = async (manual = false) => {
   if (!manual) {
     const last = await readStorageNumber(LAST_AUTO_SYNC_AT_KEY);
     if (last && Date.now() - last < AUTO_SYNC_COOLDOWN_MS) {
-      updateStatus(`自動同期はスキップ (${formatRemainLabel(AUTO_SYNC_COOLDOWN_MS - (Date.now() - last))})`);
+      updateStatus(`自動同期はスキップ\n(${formatRemainLabel(AUTO_SYNC_COOLDOWN_MS - (Date.now() - last))})`);
       try { const dbTasks = await loadTasksFromDb(); if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); } } catch { void 0; }
       return;
     }
