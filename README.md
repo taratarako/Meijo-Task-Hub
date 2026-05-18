@@ -1,108 +1,305 @@
-# Meijo Task Hub (MTH) - 技術仕様書 (v1.8)
+# Meijo Task Hub 仕様書
 
-## 1. プロジェクト概要
-名城大学 WebClass と Google Classroom の課題情報を統合し、カレンダー同期とタスク管理を実現する拡張機能。既存セッションを維持したまま、実機検証済みのロジックで自動巡回を行う。
 
-## 2. ターゲット環境
-- 対象: https://rpwebcls.meijo-u.ac.jp/webclass/*
-- 基盤: Vite + React + TypeScript + CRXJS (Manifest V3)
+## 1. 背景と主目的
 
----
+WebClass の時間割画面を開いたときに、現在の課題を同じ画面内で確認できることを主目的とします。
+確認した課題は、個別または一括で Google Calendar に追加できるようにします。
 
-## 3. 実証済み抽出ロジック (Verified Logic)
+## 2. スコープ
 
-### 3.1 巡回・正規化 (抽出確認済み)
-1. 教科抽出: メインページ table a からリンク収集、URLで重複排除。
-2. 教科名正規化: ハッシュ生成前に /\s*\(20\d{2}-.*?\)$/ で年度・時限を除去。
+対象:
+- Chrome 拡張機能 (Manifest V3)
+- WebClass 時間割画面へのダッシュボード注入
+- WebClass 課題の取得、重複排除、保存
+- Google Calendar 追加導線
 
-### 3.2 動的解析と待機処理 (抽出確認済み)
-- 動的待機: .cl-contentsList_content 出現まで最大15秒、500ms毎に監視。
-- 区分判定: innerText から優先順にキーワード抽出（試験 > レポート > 演習 > 資料）。
-- 締切取得: 正規表現 \d{4}\/\d{2}\/\d{2}.*?\d{2}:\d{2} の最後の一致を採用。
+対象外:
+- WebClass 本体改修
+- サーバーサイド専用 API の新規開発
+- モバイルアプリ
 
-### 3.3 決定論的ID生成
-- 方式: SHA-256(normalizeCourseName + title + deadline)
-- 実装: crypto.subtle.digest を使い、先頭16文字を採用。
+## 3. 技術スタック
 
----
+- フロントエンド: React + TypeScript + Vite
+- 拡張機能: Chrome Extension Manifest V3
+- データベース: Cloud Firestore
+- 認証: Firebase Authentication (Google Sign-In)
+- 日時処理: dayjs
 
-## 4. 機能要件 (Manual-First Policy)
-- 自動判定: レポート提出数 > 0 等を確認。
-- 手動管理: ユーザーのチェック操作を completedIds (storage.local) に永続化し、スキャン結果より優先してマージ。
+## 4. 実行コンポーネント
 
----
+### 4.1 popup
+- 用途: 設定表示、手動同期、一覧確認
+- エントリ: index.html -> src/main.tsx -> src/App.tsx
 
-## 5. データ構造定義 (TypeScript)
-```typescript
-type TaskType = '試験' | 'レポート' | '演習' | '資料' | 'その他';
+### 4.2 content script
+- 用途: WebClass 画面 DOM 解析、課題抽出、画面内ダッシュボード表示
+- エントリ: src/content.tsx
 
-interface UnifiedTask {
-  readonly id: string;           // 検証済み SHA-256 ID
-  readonly source: 'WebClass' | 'Classroom' | 'Manual';
-  readonly courseName: string;   // 正規化済み教科名
-  title: string;
-  type: TaskType;
-  endAt: string | null;          // ISO8601
-  link?: string;
-  isCompleted: boolean;          // 手動・自動マージ後
-}
+### 4.3 background service worker
+- 用途: 将来的な定期同期、通知仲介、認証状態監視
+- エントリ: src/background.ts
 
-interface StorageSchema {
-  tasks: UnifiedTask[];
-  completedIds: string[];        // 完了済みID配列
-  lastScanAt: number;
-}
-```
----
+### 4.4 firebase
+- 用途: Firebase 初期化、Firestore/Auth クライアント提供
+- エントリ: src/firebase.ts
 
-## 6. 実装フェーズ詳細コード (Implementation Blueprint)
+## 5. ユースケース
 
-### 6.1 核心ロジックの参照実装
-```
-// src/utils/crypto.ts: ID生成
-export const generateId = async (course: string, title: string, deadline: string): Promise<string> => {
-  const seed = `${course.trim()}_${title.trim()}_${deadline || 'none'}`;
-  const msgUint8 = new TextEncoder().encode(seed);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
-};
+UC-01 自動同期:
+- ユーザーが WebClass 時間割画面を開く
+- 自動同期が起動し、課題一覧が更新される
 
-// src/utils/scanner.ts: 区分判定
-export const classifyType = (text: string): TaskType => {
-  if (text.includes('試験')) return '試験';
-  if (text.includes('レポート')) return 'レポート';
-  if (text.includes('演習')) return '演習';
-  if (text.includes('資料')) return '資料';
-  return 'その他';
-};
-```
----
+UC-02 手動同期:
+- ユーザーが手動再同期を実行する
+- 最新データで再取得する
 
-## 7. 開発開始用コマンド
+UC-03 個別カレンダー追加:
+- ユーザーが課題カードの追加ボタンを押す
+- 対象課題のみ Calendar に追加する
 
-### 7.1 環境構築
-# 1. プロジェクト作成
-```
-npm create vite@latest meijo-task-hub -- --template react-ts
-cd meijo-task-hub
-```
-# 2. 依存関係
-```
-npm install @crxjs/vite-plugin@latest lucide-react dayjs -D
-```
-# 3. CSS
-```
-npm install -D tailwindcss postcss autoprefixer
-npx tailwindcss init -p
-```
-### 7.2 Manifest V3 構成テンプレート
-```
-{
-  "manifest_version": 3,
-  "name": "Meijo Task Hub",
-  "version": "1.0.0",
-  "permissions": ["storage", "cookies", "identity", "alarms", "offscreen"],
-  "host_permissions": ["https://rpwebcls.meijo-u.ac.jp/*"],
-  "background": { "service_worker": "src/background.ts", "type": "module" }
-}
-```
+UC-04 一括カレンダー追加:
+- ユーザーが一括同期ボタンを押す
+- 表示中の課題をまとめて Calendar に追加する
+
+## 6. 機能要件
+
+FR-01 起動トリガー:
+- WebClass 時間割画面で自動同期する
+- popup または画面内ボタンで手動同期できる
+
+FR-02 表示条件:
+- 期限切れ課題は表示しない
+
+FR-03 重複判定:
+- 第1優先: courseId + taskId
+- フォールバック: courseName + title
+
+FR-04 保存形式:
+- endAt は Firestore Timestamp とする
+
+FR-05 認証:
+- Google ログイン必須
+- データはユーザー単位で保存分離
+
+FR-06 UI:
+- WebClass 課題と Google Classroom 課題をセクション表示
+- 締切順ソート、科目/期限フィルタ、完了チェック
+- 同期失敗通知を表示
+
+FR-07 カレンダー連携:
+- 個別追加と一括追加の双方を提供
+
+## 7. 同期ロジック仕様
+
+1. 対象ページ判定:
+- URL に /webclass/ と main/timetable を含む場合を対象
+
+2. 科目リンク収集:
+- a[href*='course.php'] を取得
+- href でユニーク化
+
+3. 科目ごとの課題取得:
+- 非表示 iframe で科目ページを順次ロード
+- .cl-contentsList_content を探索
+- 最大 20 秒でタイムアウト
+
+4. 課題抽出:
+- タイトル抽出、ノイズ語除去
+- 期限文字列を抽出して Timestamp に変換
+- 期限切れを除外
+
+5. 一意キー決定:
+- courseId/taskId が取得できる場合はそれを使用
+- 取得できない場合は courseName/title の正規化キーを使用
+
+6. DB 反映:
+- users/{uid}/tasks/{taskKey} へ upsert
+- 更新日時を serverTimestamp で記録
+
+7. UI 反映:
+- ダッシュボードを再描画
+- 失敗件数があれば通知領域に表示
+
+## 8. Firestore データ構造
+
+### 8.1 コレクション設計
+
+users/{uid}
+  profile
+    - displayName: string
+    - email: string
+    - university: string
+    - createdAt: timestamp
+    - updatedAt: timestamp
+
+users/{uid}/tasks/{taskKey}
+  - taskKey: string
+  - source: string                    # WebClass | GoogleClassroom | Manual
+  - courseId: string | null
+  - taskId: string | null
+  - courseName: string
+  - title: string
+  - description: string | null
+  - taskUrl: string | null
+  - endAt: timestamp
+  - isCompleted: boolean
+  - isOverdue: boolean
+  - calendarSynced: boolean
+  - calendarEventId: string | null
+  - lastSyncAt: timestamp
+  - createdAt: timestamp
+  - updatedAt: timestamp
+
+users/{uid}/syncLogs/{logId}
+  - startedAt: timestamp
+  - finishedAt: timestamp
+  - status: string                    # success | partial | failed
+  - scannedCourses: number
+  - upsertedTasks: number
+  - skippedOverdue: number
+  - errorCount: number
+  - errors: array<string>
+
+### 8.2 インデックス要件
+
+- users/{uid}/tasks:
+  - source ASC, endAt ASC
+  - isCompleted ASC, endAt ASC
+  - courseName ASC, endAt ASC
+
+### 8.3 データ整合ルール
+
+- taskKey はドキュメント ID と一致
+- isOverdue は endAt との比較結果を反映
+- updatedAt は更新毎に serverTimestamp
+
+## 9. Firestore セキュリティルール方針
+
+- users/{uid} 以下は request.auth.uid == uid のみアクセス可能
+- 未認証アクセスは deny
+- universities など共通マスタを追加する場合は read のみ開放、write は管理者限定
+
+## 10. DOM セレクタ契約
+
+本章のセレクタは、将来変更時にまず更新すべき契約です。
+
+- courseLinkSelector: a[href*='course.php']
+- taskItemSelector: .cl-contentsList_content
+- dashboardMountPoint: WebClass 時間割画面の左ペイン先頭
+
+セレクタ変更時の実装ルール:
+- 文字列を単一点管理 (selectors 定数) する
+- 本番変更前に最低 3 科目以上で同期確認する
+
+## 11. Google Calendar 連携仕様
+
+### 11.1 個別追加
+
+- 課題カードのボタン押下で 1 件追加
+- 成功時は calendarSynced=true
+- 失敗時は UI 通知と syncLogs 記録
+
+### 11.2 一括追加
+
+- フィルタ後の可視課題を対象に逐次登録
+- API 制限対策として短い間隔で送信する
+
+### 11.3 競合時ポリシー
+
+- 同一 taskKey で既存 calendarEventId がある場合は重複作成しない
+
+## 12. 権限と設定
+
+### 12.1 Chrome 権限
+
+- storage
+- identity
+- alarms
+- host_permissions: https://rpwebcls.meijo-u.ac.jp/webclass/*
+  - Google Classroom API を使うため、以下も追加
+    - https://classroom.googleapis.com/*
+    - https://www.googleapis.com/*
+
+### 12.1.1 Google Classroom OAuth
+
+manifest.json の oauth2.client_id は固定せず、ビルド時に環境変数から注入する。
+scopes は classroom.courses.readonly と classroom.coursework.me.readonly を設定する。
+
+環境変数:
+- MTH_GOOGLE_OAUTH_CLIENT_ID
+
+開発時は .env.local、本番ビルド時は .env.production に設定する。
+テンプレートは .env.example を参照。
+
+### 12.2 環境変数
+
+- VITE_FIREBASE_API_KEY
+- VITE_FIREBASE_AUTH_DOMAIN
+- VITE_FIREBASE_PROJECT_ID
+- VITE_FIREBASE_STORAGE_BUCKET
+- VITE_FIREBASE_MESSAGING_SENDER_ID
+- VITE_FIREBASE_APP_ID
+
+## 13. エラーハンドリング仕様
+
+エラー分類:
+- E_AUTH_REQUIRED: 未ログイン
+- E_SELECTOR_NOT_FOUND: DOM 変更疑い
+- E_IFRAME_TIMEOUT: 科目ページ読み込み失敗
+- E_DB_WRITE_FAILED: Firestore 書き込み失敗
+- E_CALENDAR_FAILED: Calendar 追加失敗
+
+表示仕様:
+- 画面内通知エリアに最新エラーを表示
+- 同期サマリに件数表示 (成功件数/失敗件数)
+
+## 14. 受け入れ基準
+
+AC-01:
+- WebClass 時間割画面表示後、5 秒以内にダッシュボードが表示される
+
+AC-02:
+- 手動再同期後、一覧が再取得結果で更新される
+
+AC-03:
+- 期限切れ課題は表示されない
+
+AC-04:
+- courseId/taskId が取得できる課題で重複が発生しない
+
+AC-05:
+- 同期失敗時にユーザーへ UI 通知される
+
+AC-06:
+- 個別追加・一括追加で Calendar 追加できる
+
+AC-07:
+- 認証なし状態ではデータ保存が拒否される
+
+## 15. 実装タスクの優先順
+
+P0:
+- Google ログイン導入
+- users/{uid}/tasks スキーマで保存処理へ移行
+- ダッシュボード UI の最小実装
+
+P1:
+- Timestamp 正規化
+- 重複判定の C 優先 + A フォールバック実装
+- 同期エラー通知
+
+P2:
+- Calendar 個別追加
+- Calendar 一括追加
+- フィルタ/完了チェック
+
+## 16. 現状実装との差分
+
+- popup はテンプレート画面で、要件 UI は未実装
+- 認証必須化と users/{uid} 分離保存は未実装
+- 期限は文字列抽出中心で Timestamp 化が未完了
+- 主キーは現状 courseName + title 中心
+- background の本格利用は未着手
+
