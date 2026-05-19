@@ -1,5 +1,6 @@
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
-import { db } from "./firebase";
+import { GoogleAuthProvider, signInWithCredential } from "firebase/auth";
+import { auth, db } from "./firebase";
 
 type GoogleCourse = {
 	id: string;
@@ -47,6 +48,17 @@ type CalendarsResponse = {
 	ok: boolean;
 	message: string;
 	calendars?: Calendar[];
+};
+
+type AuthTokenMessage = {
+	type: "mth-get-auth-token";
+	interactive?: boolean;
+};
+
+type AuthTokenResponse = {
+	ok: boolean;
+	message?: string;
+	token?: string;
 };
 
 type AddEventMessage = {
@@ -116,6 +128,13 @@ const getAuthToken = (interactive: boolean): Promise<string> =>
 		});
 	});
 
+const ensureFirebaseAuthWithToken = async (token: string): Promise<string> => {
+	if (auth.currentUser?.uid) return auth.currentUser.uid;
+	const credential = GoogleAuthProvider.credential(null, token);
+	const result = await signInWithCredential(auth, credential);
+	return result.user.uid;
+};
+
 const fetchAllCourses = async (token: string): Promise<GoogleCourse[]> => {
 	let nextPageToken: string | undefined;
 	const courses: GoogleCourse[] = [];
@@ -145,12 +164,11 @@ const fetchAllCourses = async (token: string): Promise<GoogleCourse[]> => {
 const toDueMs = (work: GoogleCourseWork): number | null => {
 	const dueDate = work.dueDate;
 	if (!dueDate?.year || !dueDate.month || !dueDate.day) return null;
+	const hasTime = Boolean(work.dueTime);
 	const hours = work.dueTime?.hours ?? 23;
-	const minutes = work.dueTime?.minutes ?? 59;
-	// ClassroomのdueDate/dueTimeはローカル時刻として解釈する
-	const localMs = new Date(dueDate.year, dueDate.month - 1, dueDate.day, hours, minutes, 0, 0).getTime();
-	// 8時間早いズレを補正
-	return localMs + 8 * 60 * 60 * 1000;
+	const minutes = work.dueTime?.minutes ?? (hasTime ? 0 : 59);
+	// ClassroomのdueDate/dueTimeはUTCとして扱い、表示時にローカル変換する
+	return Date.UTC(dueDate.year, dueDate.month - 1, dueDate.day, hours, minutes, 0, 0);
 };
 
 const formatDueLabel = (ms: number | null): string => {
@@ -173,7 +191,7 @@ const fetchCourseWork = async (token: string, course: GoogleCourse): Promise<Goo
 	return body.courseWork ?? [];
 };
 
-const upsertGoogleTask = async (task: {
+const upsertGoogleTask = async (uid: string, task: {
 	taskKey: string;
 	course: string;
 	title: string;
@@ -185,7 +203,7 @@ const upsertGoogleTask = async (task: {
 	taskId: string;
 }) => {
 	await setDoc(
-		doc(db, "tasks", task.taskKey),
+		doc(db, "users", uid, "tasks", task.taskKey),
 		{
 			course: task.course,
 			title: task.title,
@@ -204,6 +222,7 @@ const upsertGoogleTask = async (task: {
 
 const syncGoogleClassroom = async (interactive: boolean): Promise<SyncResponse> => {
 	const token = await getAuthToken(interactive);
+	const uid = await ensureFirebaseAuthWithToken(token);
 	const courses = await fetchAllCourses(token);
 	let synced = 0;
 
@@ -212,7 +231,7 @@ const syncGoogleClassroom = async (interactive: boolean): Promise<SyncResponse> 
 		for (const work of works) {
 			if (!work.id) continue;
 			const endAtMs = toDueMs(work);
-			await upsertGoogleTask({
+			await upsertGoogleTask(uid, {
 				taskKey: `gclass_${course.id}_${work.id}`,
 				course: course.name,
 				title: work.title?.trim() || "無題課題",
@@ -315,7 +334,7 @@ const createCalendarEvent = async (
 };
 
 extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, sendResponse: (response: unknown) => void) => {
-	const msg = message as SyncMessage | CalendarsMessage | AddEventMessage;
+	const msg = message as SyncMessage | CalendarsMessage | AddEventMessage | AuthTokenMessage;
 	
 	if (msg.type === "mth-sync-google-classroom") {
 		void syncGoogleClassroom(Boolean(msg.interactive))
@@ -355,6 +374,19 @@ extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, send
 			} catch (error) {
 				const messageText = error instanceof Error ? error.message : "カレンダーへの追加に失敗しました";
 				sendResponse({ ok: false, message: messageText } satisfies AddEventResponse);
+			}
+		})();
+		return true;
+	}
+
+	if (msg.type === "mth-get-auth-token") {
+		void (async () => {
+			try {
+				const token = await getAuthToken(Boolean(msg.interactive));
+				sendResponse({ ok: true, token } satisfies AuthTokenResponse);
+			} catch (error) {
+				const messageText = error instanceof Error ? error.message : "認証トークン取得に失敗しました";
+				sendResponse({ ok: false, message: messageText } satisfies AuthTokenResponse);
 			}
 		})();
 		return true;

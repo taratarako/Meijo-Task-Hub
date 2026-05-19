@@ -1,32 +1,25 @@
-import { db } from "./firebase";
-import { collection, deleteDoc, doc, getDocs, limit, orderBy, query, serverTimestamp, setDoc } from "firebase/firestore";
-
-type ExtractedTask = {
-  taskKey: string;
-  course: string;
-  title: string;
-  endAtRaw: string;
-  endAtMs: number | null;
-  taskUrl: string | null;
-  courseId: string | null;
-  taskId: string | null;
-  source: "WebClass_AutoSync" | "GoogleClassroom";
-  hidden?: boolean;
-  hiddenUntil?: number | null;
-  hiddenAt?: number | null;
-};
-
-type Calendar = {
-  id: string;
-  summary: string;
-};
-
-const DATE_TOKEN_REGEX = /(\d{4})\/(\d{1,2})\/(\d{1,2})(?:[^\d]+(\d{1,2}):(\d{2}))?/g;
-const PANEL_ID = "meijo-task-hub-panel";
-const AUTO_SYNC_COOLDOWN_MS = 60 * 60 * 1000;
-const LAST_AUTO_SYNC_AT_KEY = "mth-last-auto-sync-at";
-const TASK_INCLUDE_KEYWORDS = ["課題", "提出", "レポート", "演習", "小テスト", "テスト", "quiz", "assignment"];
-const TASK_EXCLUDE_KEYWORDS = ["お知らせ", "連絡", "資料", "教材", "案内", "出席", "時間割", "成績", "アンケート", "掲示"];
+import { deleteDoc, setDoc } from "firebase/firestore";
+import { ensureSignedIn } from "./content/auth";
+import { AUTO_SYNC_COOLDOWN_MS, LAST_AUTO_SYNC_AT_KEY, PANEL_ID } from "./content/constants";
+import { getTaskDoc, loadTasksFromDb, upsertTask } from "./content/db";
+import {
+  extractCourseCode,
+  extractDueInfo,
+  extractQueryParam,
+  isLikelyTaskItem,
+  normalizeKey,
+  resolveTitle,
+  sanitizeForKey,
+} from "./content/extract";
+import { extensionChrome } from "./content/runtime";
+import { readStorageNumber, writeStorageNumber } from "./content/storage";
+import type {
+  AddCalendarEventResponse,
+  Calendar,
+  CalendarListResponse,
+  ExtractedTask,
+  GoogleSyncResponse,
+} from "./content/types";
 
 let syncing = false;
 let lastTasks: ExtractedTask[] = [];
@@ -35,57 +28,6 @@ let lastObservedHref = location.href;
 let wasOnTimetablePage = false;
 let selectedCalendarId: string | null = null;
 let availableCalendars: Calendar[] = [];
-
-const extensionChrome = (globalThis as typeof globalThis & {
-  chrome?: {
-    runtime?: {
-      sendMessage: (message: unknown, callback?: (response: unknown) => void) => void;
-      lastError?: { message?: string };
-    };
-    storage?: {
-      local?: {
-        get: (keys: string[], callback: (items: Record<string, unknown>) => void) => void;
-        set: (items: Record<string, unknown>, callback: () => void) => void;
-      };
-    };
-  };
-}).chrome;
-
-const readStorageNumber = async (key: string): Promise<number | null> => {
-  const storageLocal = extensionChrome?.storage?.local;
-  if (storageLocal) {
-    const value = await new Promise<number | null>((resolve) => {
-      storageLocal.get([key], (items) => {
-        const raw = items[key];
-        resolve(typeof raw === "number" ? raw : null);
-      });
-    });
-    if (value !== null) return value;
-  }
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    const parsed = Number(raw);
-    return Number.isFinite(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-};
-
-const writeStorageNumber = async (key: string, value: number): Promise<void> => {
-  const storageLocal = extensionChrome?.storage?.local;
-  if (storageLocal) {
-    await new Promise<void>((resolve) => {
-      storageLocal.set({ [key]: value }, () => resolve());
-    });
-    return;
-  }
-  try {
-    localStorage.setItem(key, String(value));
-  } catch {
-    void 0;
-  }
-};
 
 const formatRemainLabel = (ms: number): string => {
   const remainMinutes = Math.max(1, Math.ceil(ms / (60 * 1000)));
@@ -105,102 +47,6 @@ const isTargetTimetablePage = (): boolean => {
   const courseLinkCount = document.querySelectorAll("a[href*='course.php']").length;
   if (courseLinkCount >= 3) return true;
   return false;
-};
-
-const normalizeKey = (value: string): string =>
-  value.replace(/[\r\n\t]+/g, " ").replace(/[\\/\s]+/g, "_").replace(/_+/g, "_").trim();
-
-const extractCourseCode = (value: string): string | null => {
-  if (!value) return null;
-  const m = value.match(/\b(\d{5})\b/);
-  return m ? m[1] : null;
-};
-
-const normalizeSpaces = (s: string) => s.replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
-
-const sanitizeForKey = (value: string): string => {
-  if (!value) return value;
-  let v = normalizeSpaces(value);
-  const noisePatterns = ["締切が近い課題があります", "締切が近い", "提出期限が近い", "締切間近", "期限切れ", "期限切れです"];
-  for (const p of noisePatterns) {
-    const re = new RegExp(`[（(\\[]?\\s*${p}\\s*[）)\\]]?\\.?`, "gi");
-    v = v.replace(re, "");
-  }
-  v = v.replace(/^[»»>\-\u2022\s]+/, "");
-  v = v.replace(/\s+/g, " ").trim();
-  return v;
-};
-
-const parseDatePartsToMs = (parts: RegExpMatchArray): number | null => {
-  const [, y, m, d, hh = "23", mm = "59"] = parts;
-  const asDate = new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), 0, 0);
-  if (Number.isNaN(asDate.getTime())) return null;
-  return asDate.getTime();
-};
-
-const extractDueInfo = (text: string): { raw: string; ms: number | null } => {
-  const normalized = text.replace(/\s+/g, " ");
-  const matches = Array.from(normalized.matchAll(DATE_TOKEN_REGEX));
-  if (matches.length === 0) return { raw: "期限なし", ms: null };
-  const withMs = matches.map((m) => ({ match: m, ms: parseDatePartsToMs(m) })).filter((item) => item.ms !== null) as Array<{ match: RegExpMatchArray; ms: number }>;
-  if (withMs.length === 0) return { raw: matches[matches.length - 1][0], ms: null };
-  const dueHintLabels = ["締切", "提出期限", "期限", "終了", "〆切"];
-  const hintIndex = dueHintLabels.map((label) => normalized.lastIndexOf(label)).filter((index) => index >= 0).sort((a, b) => b - a)[0];
-  if (hintIndex !== undefined) {
-    const afterHint = withMs.filter((item) => (item.match.index ?? 0) >= hintIndex);
-    if (afterHint.length > 0) {
-      const latestAfterHint = afterHint.reduce((prev, cur) => (cur.ms > prev.ms ? cur : prev));
-      return { raw: latestAfterHint.match[0], ms: latestAfterHint.ms };
-    }
-  }
-  const latest = withMs.reduce((prev, cur) => (cur.ms > prev.ms ? cur : prev));
-  return { raw: latest.match[0], ms: latest.ms };
-};
-
-const extractQueryParam = (url: string, key: string): string | null => {
-  try {
-    const parsed = new URL(url, location.origin);
-    return parsed.searchParams.get(key);
-  } catch {
-    return null;
-  }
-};
-
-const resolveTitle = (element: Element): string => {
-  const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
-  const stripNewPrefix = (value: string): string => value.replace(/^new\s*/i, "").replace(/^【?new】?\s*/i, "").trim();
-  const isNoise = (value: string): boolean => {
-    if (!value) return true;
-    const v = value.trim();
-    if (/^(new|詳細|利用回数|教材|タイムライン|お知らせ|試験|利用可能期間|期限|締切)$/i.test(v)) return true;
-    if (/^(\d+|\d+件)$/i.test(v)) return true;
-    if (/(締切が近い|提出期限が近い|締切間近|期限切れ|期限切れです|期限切れの課題)/i.test(v)) return true;
-    return false;
-  };
-  const scoreTitle = (value: string): number => {
-    let score = 0;
-    if (/[課題演習レポート提出テストquiz]/i.test(value)) score += 30;
-    if (/第\d+回/.test(value)) score += 15;
-    if (value.length >= 6) score += 10;
-    if (value.length >= 12) score += 8;
-    if (/詳細|利用回数|利用可能期間/.test(value)) score -= 40;
-    return score;
-  };
-  const candidates: string[] = [];
-  const anchors = Array.from(element.querySelectorAll("a"));
-  for (const anchor of anchors) {
-    const clean = stripNewPrefix(normalize(anchor.textContent || ""));
-    if (!isNoise(clean)) candidates.push(clean);
-  }
-  const headingCandidates = [element.querySelector("h1")?.textContent, element.querySelector("h2")?.textContent, element.querySelector("h3")?.textContent, element.querySelector("h4")?.textContent, element.querySelector("strong")?.textContent];
-  for (const candidate of headingCandidates) {
-    const clean = stripNewPrefix(normalize(candidate || ""));
-    if (!isNoise(clean)) candidates.push(clean);
-  }
-  const uniqueCandidates = Array.from(new Set(candidates)).filter((c) => !isNoise(c));
-  if (uniqueCandidates.length === 0) return "無題課題";
-  uniqueCandidates.sort((a, b) => scoreTitle(b) - scoreTitle(a) || b.length - a.length);
-  return uniqueCandidates[0];
 };
 
 const renderTasks = (tasks: ExtractedTask[]) => {
@@ -272,6 +118,11 @@ const renderTasks = (tasks: ExtractedTask[]) => {
 };
 
 const handleDeleteTask = async (task: ExtractedTask) => {
+  const uid = await ensureSignedIn(true);
+  if (!uid) {
+    alert("ログインが必要です");
+    return;
+  }
   const now = Date.now();
   // 楽観的UI更新
   lastTasks = lastTasks.filter((t) => t.taskKey !== task.taskKey);
@@ -279,33 +130,16 @@ const handleDeleteTask = async (task: ExtractedTask) => {
 
   try {
     if (typeof task.endAtMs === "number" && task.endAtMs < now) {
-      await deleteDoc(doc(db, "tasks", task.taskKey));
+      await deleteDoc(getTaskDoc(uid, task.taskKey));
     } else if (typeof task.endAtMs === "number") {
-      await setDoc(doc(db, "tasks", task.taskKey), { hidden: true, hiddenUntil: task.endAtMs, hiddenAt: now }, { merge: true });
+      await setDoc(getTaskDoc(uid, task.taskKey), { hidden: true, hiddenUntil: task.endAtMs, hiddenAt: now }, { merge: true });
     } else {
-      await setDoc(doc(db, "tasks", task.taskKey), { hidden: true, hiddenUntil: null, hiddenAt: now }, { merge: true });
+      await setDoc(getTaskDoc(uid, task.taskKey), { hidden: true, hiddenUntil: null, hiddenAt: now }, { merge: true });
     }
   } catch (error) {
     console.error("❌ 削除処理に失敗:", error);
     void refreshTasksFromDb("同期エラーのため再取得");
   }
-};
-
-const isLikelyTaskItem = (element: Element): boolean => {
-  const text = (element.textContent || "").replace(/\s+/g, " ").toLowerCase();
-  const anchorHref = (element.querySelector("a[href]") as HTMLAnchorElement | null)?.href.toLowerCase() || "";
-  const targetText = `${text} ${anchorHref}`;
-  if (!targetText.trim()) return false;
-  if (TASK_EXCLUDE_KEYWORDS.some((keyword) => targetText.includes(keyword.toLowerCase()))) return false;
-  if (TASK_INCLUDE_KEYWORDS.some((keyword) => targetText.includes(keyword.toLowerCase()))) return true;
-  if (anchorHref && (anchorHref.includes("content_id=") || anchorHref.includes("id="))) return true;
-  try {
-    const title = resolveTitle(element) || "";
-    if (title && title !== "無題課題" && title.trim().length >= 3) {
-      if (/(締切|提出期限|期限|due)/i.test(targetText) || TASK_INCLUDE_KEYWORDS.some((k) => targetText.includes(k.toLowerCase()))) return true;
-    }
-  } catch { void 0; }
-  return false;
 };
 
 const formatDueLabel = (task: ExtractedTask): string => {
@@ -322,10 +156,10 @@ const isOverdue = (task: ExtractedTask): boolean => {
 const fetchCalendars = async (): Promise<void> => {
   if (!extensionChrome?.runtime?.sendMessage) return;
   try {
-    const res = await new Promise<{ ok?: boolean; calendars?: Calendar[] } | undefined>(r =>
+    const res = await new Promise<CalendarListResponse | undefined>((r) =>
       extensionChrome?.runtime?.sendMessage?.(
         { type: "mth-get-calendars", interactive: true },
-        (response) => r(response as { ok?: boolean; calendars?: Calendar[] } | undefined)
+        (response) => r(response as CalendarListResponse | undefined)
       )
     );
     if (res?.ok && res.calendars) {
@@ -345,7 +179,7 @@ const addTaskToCalendar = async (task: ExtractedTask): Promise<void> => {
   }
 
   try {
-    const res = await new Promise<{ ok?: boolean; message?: string } | undefined>(r =>
+    const res = await new Promise<AddCalendarEventResponse | undefined>((r) =>
       extensionChrome?.runtime?.sendMessage?.(
         {
           type: "mth-add-calendar-event",
@@ -359,7 +193,7 @@ const addTaskToCalendar = async (task: ExtractedTask): Promise<void> => {
           },
           interactive: true,
         },
-        (response) => r(response as { ok?: boolean; message?: string } | undefined)
+        (response) => r(response as AddCalendarEventResponse | undefined)
       )
     );
     if (res?.ok) {
@@ -398,7 +232,7 @@ const addAllTasksToCalendar = async (): Promise<void> => {
   let added = 0;
   for (const task of tasksToAdd) {
     try {
-      const res = await new Promise<{ ok?: boolean; message?: string } | undefined>(r =>
+      const res = await new Promise<AddCalendarEventResponse | undefined>((r) =>
         extensionChrome?.runtime?.sendMessage?.(
           {
             type: "mth-add-calendar-event",
@@ -412,7 +246,7 @@ const addAllTasksToCalendar = async (): Promise<void> => {
             },
             interactive: false,
           },
-          (response) => r(response as { ok?: boolean; message?: string } | undefined)
+          (response) => r(response as AddCalendarEventResponse | undefined)
         )
       );
       if (res?.ok) added += 1;
@@ -569,38 +403,14 @@ const updateCount = (count: number) => {
   if (countEl) countEl.textContent = String(count);
 };
 
-const upsertTask = async (task: ExtractedTask) => {
-  await setDoc(doc(db, "tasks", task.taskKey), {
-    course: task.course, title: task.title, endAt: task.endAtRaw, endAtMs: task.endAtMs,
-    taskUrl: task.taskUrl, courseId: task.courseId, taskId: task.taskId, source: task.source, updatedAt: serverTimestamp(),
-  }, { merge: true });
-};
-
-const loadTasksFromDb = async (max = 120): Promise<ExtractedTask[]> => {
-  const q = query(collection(db, "tasks"), orderBy("updatedAt", "desc"), limit(max));
-  const snapshot = await getDocs(q), now = Date.now(), toDelete: string[] = [];
-  const items: ExtractedTask[] = snapshot.docs.map((row) => {
-    const data = row.data();
-    return {
-      taskKey: row.id, course: data.course || "不明な教科", title: data.title || "無題課題",
-      endAtRaw: data.endAt || "期限なし", endAtMs: data.endAtMs, taskUrl: data.taskUrl || null,
-      courseId: data.courseId || null, taskId: data.taskId || null,
-      source: data.source === "GoogleClassroom" ? "GoogleClassroom" : "WebClass_AutoSync",
-      hidden: data.hidden, hiddenUntil: data.hiddenUntil, hiddenAt: data.hiddenAt,
-    };
-  });
-  const visible = items.filter((task) => {
-    if (typeof task.endAtMs === "number" && task.endAtMs < now) { toDelete.push(task.taskKey); return false; }
-    if (task.hidden) { if (typeof task.hiddenUntil === "number" && task.hiddenUntil <= now) toDelete.push(task.taskKey); return false; }
-    return true;
-  });
-  if (toDelete.length > 0) await Promise.all(toDelete.map((key) => deleteDoc(doc(db, "tasks", key))));
-  return Array.from(new Map(visible.map(t => [t.taskKey, t])).values());
-};
-
 const refreshTasksFromDb = async (label: string) => {
   try {
-    const dbTasks = await loadTasksFromDb();
+    const uid = await ensureSignedIn(false);
+    if (!uid) {
+      updateStatus("ログインが必要です");
+      return;
+    }
+    const dbTasks = await loadTasksFromDb(uid);
     if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); updateStatus(label); }
   } catch (error) { console.error("❌ DB読込失敗:", error); }
 };
@@ -652,16 +462,21 @@ const setSyncButtonDisabled = (disabled: boolean) => {
 
 const startAutoSync = async (manual = false) => {
   if (syncing) return;
+  const uid = await ensureSignedIn(manual);
+  if (!uid) {
+    updateStatus("ログインが必要です");
+    return;
+  }
   if (!isTargetTimetablePage()) {
     ensurePanel(); setSyncButtonDisabled(false); updateStatus("メイン画面以外では同期しません (DB表示のみ)");
-    try { const dbTasks = await loadTasksFromDb(); if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); } } catch { void 0; }
+    try { const dbTasks = await loadTasksFromDb(uid); if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); } } catch { void 0; }
     return;
   }
   if (!manual) {
     const last = await readStorageNumber(LAST_AUTO_SYNC_AT_KEY);
     if (last && Date.now() - last < AUTO_SYNC_COOLDOWN_MS) {
       updateStatus(`自動同期はスキップ\n(${formatRemainLabel(AUTO_SYNC_COOLDOWN_MS - (Date.now() - last))})`);
-      try { const dbTasks = await loadTasksFromDb(); if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); } } catch { void 0; }
+      try { const dbTasks = await loadTasksFromDb(uid); if (dbTasks.length > 0) { lastTasks = dbTasks; renderTasks(lastTasks); } } catch { void 0; }
       return;
     }
   }
@@ -670,7 +485,7 @@ const startAutoSync = async (manual = false) => {
   try {
     const googlePromise = requestGoogleClassroomSync(manual), links = getUniqueCourseLinks();
     if (links.length === 0) {
-      const dbTasks = await loadTasksFromDb(); lastTasks = dbTasks; renderTasks(lastTasks);
+      const dbTasks = await loadTasksFromDb(uid); lastTasks = dbTasks; renderTasks(lastTasks);
       updateStatus(`科目未検出 / DBから${dbTasks.length}件表示 / ${await googlePromise || ""}`);
       return;
     }
@@ -680,8 +495,8 @@ const startAutoSync = async (manual = false) => {
       try { allTasks.push(...await extractCourseTasks(links[i].href, links[i].textContent?.trim() || "不明")); } catch { void 0; }
     }
     const deduped = Array.from(new Map(allTasks.map(t => [t.taskKey, t])).values());
-    for (const t of deduped) try { await upsertTask(t); } catch { void 0; }
-    lastTasks = await loadTasksFromDb(); renderTasks(lastTasks);
+    for (const t of deduped) try { await upsertTask(uid, t); } catch { void 0; }
+    lastTasks = await loadTasksFromDb(uid); renderTasks(lastTasks);
     updateStatus(`同期完了: ${deduped.length}件抽出 / ${await googlePromise || ""}`);
     if (!manual) await writeStorageNumber(LAST_AUTO_SYNC_AT_KEY, Date.now());
   } finally { syncing = false; setSyncButtonDisabled(false); }
@@ -690,10 +505,10 @@ const startAutoSync = async (manual = false) => {
 const requestGoogleClassroomSync = async (interactive: boolean): Promise<string | null> => {
   if (!extensionChrome?.runtime?.sendMessage) return null;
   try {
-    const res = await new Promise<{ ok?: boolean; message?: string } | undefined>(r =>
-      extensionChrome.runtime?.sendMessage?.(
+    const res = await new Promise<GoogleSyncResponse | undefined>((r) =>
+      extensionChrome?.runtime?.sendMessage?.(
         { type: "mth-sync-google-classroom", interactive },
-        (response) => r(response as { ok?: boolean; message?: string } | undefined)
+        (response) => r(response as GoogleSyncResponse | undefined)
       )
     );
     return res?.ok ? (res.message || "同期完了") : `Google Classroom失敗: ${res?.message || "不明"}`;
@@ -704,7 +519,18 @@ const handleRouteState = () => {
   const onTimetable = isTargetTimetablePage();
   ensurePanel(); setSyncButtonDisabled(false);
   if (onTimetable && !wasOnTimetablePage) { void startAutoSync(false); }
-  else if (!onTimetable) { updateStatus("メイン画面以外では同期しません (DB表示のみ)"); if (lastTasks.length === 0) void loadTasksFromDb().then(t => { lastTasks = t; renderTasks(t); }); }
+  else if (!onTimetable) {
+    updateStatus("メイン画面以外では同期しません (DB表示のみ)");
+    if (lastTasks.length === 0) {
+      void (async () => {
+        const uid = await ensureSignedIn(false);
+        if (!uid) return;
+        const tasks = await loadTasksFromDb(uid);
+        lastTasks = tasks;
+        renderTasks(tasks);
+      })();
+    }
+  }
   wasOnTimetablePage = onTimetable;
 };
 
