@@ -419,7 +419,7 @@ const extractCourseTasks = (courseUrl: string, courseName: string): Promise<Extr
   new Promise((resolve) => {
     const iframe = document.createElement("iframe");
     iframe.style.display = "none"; iframe.src = courseUrl; document.body.appendChild(iframe);
-    let attempts = 0, stableTicks = 0, lastCount = -1;
+    let attempts = 0;
     const timeout = setTimeout(() => {
       clearInterval(checkInterval); if (document.body.contains(iframe)) document.body.removeChild(iframe);
       resolve([]);
@@ -428,8 +428,8 @@ const extractCourseTasks = (courseUrl: string, courseName: string): Promise<Extr
       attempts += 1; const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
       if (!iframeDoc) return;
       const elements = iframeDoc.querySelectorAll(".cl-contentsList_content");
-      if (elements.length !== lastCount) { lastCount = elements.length; stableTicks = 0; } else { stableTicks += 1; }
-      if (attempts <= 40 && !(elements.length > 0 && stableTicks >= 3)) return;
+      // Proceed as soon as any content appears, or after a minimal wait.
+      if (attempts < 2 && elements.length === 0) return;
       clearInterval(checkInterval); clearTimeout(timeout);
       const tasks: ExtractedTask[] = Array.from(elements).filter((el) => isLikelyTaskItem(el)).map((el) => {
         const text = el.textContent?.trim() || "", title = resolveTitle(el);
@@ -443,6 +443,79 @@ const extractCourseTasks = (courseUrl: string, courseName: string): Promise<Extr
       if (document.body.contains(iframe)) document.body.removeChild(iframe);
       resolve(tasks);
     }, 500);
+  });
+
+const resolveTimetableUrl = (): string | null => {
+  if (!location.href.includes("/webclass/")) return null;
+  const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
+  const timetableAnchor = anchors.find((anchor) => {
+    const text = anchor.textContent || "";
+    const href = anchor.href.toLowerCase();
+    return text.includes("時間割") || href.includes("timetable");
+  });
+  if (timetableAnchor?.href) return timetableAnchor.href;
+  const href = location.href.toLowerCase();
+  const path = location.pathname.toLowerCase();
+  const search = location.search.toLowerCase();
+  if (path.includes("/main/timetable") || search.includes("timetable") || href.includes("/main/timetable")) return location.href;
+  return `${location.origin}/webclass/main/timetable`;
+};
+
+const touchPage = (url: string): Promise<void> =>
+  new Promise((resolve) => {
+    const iframe = document.createElement("iframe");
+    iframe.style.display = "none";
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    const cleanup = () => {
+      try { iframe.remove(); } catch { void 0; }
+      resolve();
+    };
+    iframe.addEventListener("load", () => cleanup(), { once: true });
+    setTimeout(() => cleanup(), 2500);
+  });
+
+const logoutAndReturnToLogin = (): Promise<void> =>
+  new Promise((resolve) => {
+    const iframe = document.createElement("iframe");
+    iframe.style.display = "none";
+    iframe.src = "https://rpwebcls.meijo-u.ac.jp/webclass/logout.php?acs_=7a478e38";
+    document.body.appendChild(iframe);
+
+    const cleanup = () => {
+      try { iframe.remove(); } catch { void 0; }
+      resolve();
+    };
+
+    const tryClick = (): boolean => {
+      const doc = iframe.contentDocument || iframe.contentWindow?.document;
+      if (!doc) return false;
+      const candidates = Array.from(doc.querySelectorAll<HTMLElement>(
+        "button, input[type='button'], input[type='submit'], a"
+      ));
+      const target = candidates.find((el) => {
+        const text = (el.textContent || "").trim();
+        const value = (el instanceof HTMLInputElement ? el.value : "").trim();
+        return text.includes("ログイン画面に戻る") || value.includes("ログイン画面に戻る");
+      });
+      if (!target) return false;
+      target.click();
+      return true;
+    };
+
+    let tries = 0;
+    const interval = setInterval(() => {
+      tries += 1;
+      if (tryClick() || tries >= 12) {
+        clearInterval(interval);
+        setTimeout(() => cleanup(), 800);
+      }
+    }, 300);
+
+    setTimeout(() => {
+      clearInterval(interval);
+      cleanup();
+    }, 5000);
   });
 
 const getUniqueCourseLinks = (): HTMLAnchorElement[] => {
@@ -462,6 +535,7 @@ const setSyncButtonDisabled = (disabled: boolean) => {
 
 const startAutoSync = async (manual = false) => {
   if (syncing) return;
+  const returnHref = resolveTimetableUrl() || location.href;
   const uid = await ensureSignedIn(manual);
   if (!uid) {
     updateStatus("ログインが必要です");
@@ -499,6 +573,10 @@ const startAutoSync = async (manual = false) => {
     lastTasks = await loadTasksFromDb(uid); renderTasks(lastTasks);
     updateStatus(`同期完了: ${deduped.length}件抽出 / ${await googlePromise || ""}`);
     if (!manual) await writeStorageNumber(LAST_AUTO_SYNC_AT_KEY, Date.now());
+    if (returnHref.includes("/webclass/")) {
+      await touchPage(returnHref);
+    }
+    await logoutAndReturnToLogin();
   } finally { syncing = false; setSyncButtonDisabled(false); }
 };
 
