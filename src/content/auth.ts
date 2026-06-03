@@ -1,5 +1,3 @@
-import { GoogleAuthProvider, signInWithCredential } from "firebase/auth";
-import { auth } from "../firebase";
 import { extensionChrome } from "./runtime";
 
 type AuthTokenResponse = {
@@ -10,6 +8,8 @@ type AuthTokenResponse = {
 
 let activeUid: string | null = null;
 let signInPromise: Promise<string | null> | null = null;
+
+const tokenToUid = (token: string): string => `google_${token.slice(0, 12)}`;
 
 const requestAuthToken = (interactive: boolean): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -32,20 +32,14 @@ const requestAuthToken = (interactive: boolean): Promise<string> =>
 
 export const ensureSignedIn = async (interactive: boolean): Promise<string | null> => {
   if (activeUid) return activeUid;
-  if (auth.currentUser?.uid) {
-    activeUid = auth.currentUser.uid;
-    return activeUid;
-  }
   if (signInPromise) return signInPromise;
   signInPromise = (async () => {
     try {
       const token = await requestAuthToken(interactive);
-      const credential = GoogleAuthProvider.credential(null, token);
-      const result = await signInWithCredential(auth, credential);
-      activeUid = result.user.uid;
+      activeUid = tokenToUid(token);
       return activeUid;
     } catch (error) {
-      console.error("❌ Firebase認証に失敗:", error);
+      console.error("❌ 認証に失敗:", error);
       return null;
     } finally {
       signInPromise = null;

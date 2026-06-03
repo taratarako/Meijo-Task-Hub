@@ -1,7 +1,3 @@
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
-import { GoogleAuthProvider, signInWithCredential } from "firebase/auth";
-import { auth, db } from "./firebase";
-
 type GoogleCourse = {
 	id: string;
 	name: string;
@@ -128,13 +124,6 @@ const getAuthToken = (interactive: boolean): Promise<string> =>
 		});
 	});
 
-const ensureFirebaseAuthWithToken = async (token: string): Promise<string> => {
-	if (auth.currentUser?.uid) return auth.currentUser.uid;
-	const credential = GoogleAuthProvider.credential(null, token);
-	const result = await signInWithCredential(auth, credential);
-	return result.user.uid;
-};
-
 const fetchAllCourses = async (token: string): Promise<GoogleCourse[]> => {
 	let nextPageToken: string | undefined;
 	const courses: GoogleCourse[] = [];
@@ -191,38 +180,8 @@ const fetchCourseWork = async (token: string, course: GoogleCourse): Promise<Goo
 	return body.courseWork ?? [];
 };
 
-const upsertGoogleTask = async (uid: string, task: {
-	taskKey: string;
-	course: string;
-	title: string;
-	description: string | null;
-	endAtRaw: string;
-	endAtMs: number | null;
-	taskUrl: string | null;
-	courseId: string;
-	taskId: string;
-}) => {
-	await setDoc(
-		doc(db, "users", uid, "tasks", task.taskKey),
-		{
-			course: task.course,
-			title: task.title,
-			description: task.description,
-			endAt: task.endAtRaw,
-			endAtMs: task.endAtMs,
-			taskUrl: task.taskUrl,
-			courseId: task.courseId,
-			taskId: task.taskId,
-			source: "GoogleClassroom",
-			updatedAt: serverTimestamp(),
-		},
-		{ merge: true },
-	);
-};
-
 const syncGoogleClassroom = async (interactive: boolean): Promise<SyncResponse> => {
 	const token = await getAuthToken(interactive);
-	const uid = await ensureFirebaseAuthWithToken(token);
 	const courses = await fetchAllCourses(token);
 	let synced = 0;
 
@@ -230,23 +189,12 @@ const syncGoogleClassroom = async (interactive: boolean): Promise<SyncResponse> 
 		const works = await fetchCourseWork(token, course);
 		for (const work of works) {
 			if (!work.id) continue;
-			const endAtMs = toDueMs(work);
-			await upsertGoogleTask(uid, {
-				taskKey: `gclass_${course.id}_${work.id}`,
-				course: course.name,
-				title: work.title?.trim() || "無題課題",
-				description: work.description?.trim() || null,
-				endAtRaw: formatDueLabel(endAtMs),
-				endAtMs,
-				taskUrl: work.alternateLink ?? null,
-				courseId: course.id,
-				taskId: work.id,
-			});
+			void formatDueLabel(toDueMs(work));
 			synced += 1;
 		}
 	}
 
-	return { ok: true, message: `Google Classroom同期: ${synced}件`, synced };
+	return { ok: true, message: `Google Classroom同期: ${synced}件 (保存なし)`, synced };
 };
 
 const getCalendarsList = async (token: string): Promise<Calendar[]> => {

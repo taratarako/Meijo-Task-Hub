@@ -1,7 +1,6 @@
-import { deleteDoc, setDoc } from "firebase/firestore";
 import { ensureSignedIn } from "./content/auth";
 import { AUTO_SYNC_COOLDOWN_MS, LAST_AUTO_SYNC_AT_KEY, PANEL_ID } from "./content/constants";
-import { getTaskDoc, loadTasksFromDb, upsertTask } from "./content/db";
+import { deleteTask, hideTask, loadTasksFromDb, upsertTask } from "./content/db";
 import {
   extractCourseCode,
   extractDueInfo,
@@ -130,11 +129,11 @@ const handleDeleteTask = async (task: ExtractedTask) => {
 
   try {
     if (typeof task.endAtMs === "number" && task.endAtMs < now) {
-      await deleteDoc(getTaskDoc(uid, task.taskKey));
+      await deleteTask(uid, task.taskKey);
     } else if (typeof task.endAtMs === "number") {
-      await setDoc(getTaskDoc(uid, task.taskKey), { hidden: true, hiddenUntil: task.endAtMs, hiddenAt: now }, { merge: true });
+      await hideTask(uid, task.taskKey, true, task.endAtMs, now);
     } else {
-      await setDoc(getTaskDoc(uid, task.taskKey), { hidden: true, hiddenUntil: null, hiddenAt: now }, { merge: true });
+      await hideTask(uid, task.taskKey, true, null, now);
     }
   } catch (error) {
     console.error("❌ 削除処理に失敗:", error);
@@ -447,6 +446,10 @@ const extractCourseTasks = (courseUrl: string, courseName: string): Promise<Extr
 
 const resolveTimetableUrl = (): string | null => {
   if (!location.href.includes("/webclass/")) return null;
+  const loginAnchor = document.querySelector<HTMLAnchorElement>(
+    "a[href*='/webclass/course.php/'][href*='login?acs='],a[href*='/webclass/course.php/'][href*='login?acs_']",
+  );
+  if (loginAnchor?.href) return loginAnchor.href;
   const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
   const timetableAnchor = anchors.find((anchor) => {
     const text = anchor.textContent || "";
