@@ -58,8 +58,9 @@ const sendToBackground = (msg: BgApiRequest): Promise<BgApiResponse> =>
       return;
     }
     extensionChrome.runtime.sendMessage(msg, (response) => {
-      if (extensionChrome?.runtime?.lastError) {
-        reject(new Error(extensionChrome.runtime.lastError.message || "通信エラー"));
+      const err = extensionChrome?.runtime?.lastError;
+      if (err) {
+        reject(new Error(err.message || "通信エラー"));
         return;
       }
       resolve(response as BgApiResponse);
@@ -155,10 +156,14 @@ export const apiUpsertTasks = async (tasks: ExtractedTask[]): Promise<void> =>
 
 export const apiHideTask = async (taskKey: string, update: HideUpdate): Promise<void> =>
   withRefreshLock(async () => {
-    await apiFetch("/tasks/hidden", {
+    const res = await apiFetch("/tasks/hidden", {
       method: "PATCH",
       body: JSON.stringify({ taskKey, ...update }),
     });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { error?: string };
+      throw new Error(`hideTask失敗 (HTTP ${res.status}): ${body.error ?? "不明"}`);
+    }
   });
 
 export const apiDeleteTask = async (taskKey: string): Promise<void> =>

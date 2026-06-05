@@ -3,11 +3,7 @@ import { AUTO_SYNC_COOLDOWN_MS, LAST_AUTO_SYNC_AT_KEY, PANEL_ID } from "./conten
 import { deleteTask, hideTask, loadTasksFromDb, upsertTask } from "./content/db";
 import {
   extractCourseCode,
-  extractDueInfo,
-  extractQueryParam,
-  isLikelyTaskItem,
   normalizeKey,
-  resolveTitle,
   sanitizeForKey,
 } from "./content/extract";
 import { extensionChrome } from "./content/runtime";
@@ -130,12 +126,13 @@ const handleDeleteTask = async (task: ExtractedTask) => {
 
   try {
     if (typeof task.endAtMs === "number" && task.endAtMs < now) {
+      console.log("[MTH] deleteTask:", task.taskKey);
       await deleteTask(uid, task.taskKey);
-    } else if (typeof task.endAtMs === "number") {
-      await hideTask(uid, task.taskKey, true, task.endAtMs, now);
     } else {
-      await hideTask(uid, task.taskKey, true, null, now);
+      console.log("[MTH] hideTask:", task.taskKey);
+      await hideTask(uid, task.taskKey, true, task.endAtMs ?? null, now);
     }
+    console.log("[MTH] 削除/非表示 成功");
   } catch (error) {
     console.error("❌ 削除処理に失敗:", error);
     void refreshTasksFromDb("同期エラーのため再取得");
@@ -415,115 +412,104 @@ const refreshTasksFromDb = async (label: string) => {
   } catch (error) { console.error("❌ DB読込失敗:", error); }
 };
 
-const extractCourseTasks = (courseUrl: string, courseName: string): Promise<ExtractedTask[]> =>
+const parseDashboardDate = (text: string): number | null => {
+  const m = text.match(/(\d{4})-(\d{1,2})-(\d{1,2})[\s\S]*?(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
+  return Number.isNaN(dt.getTime()) ? null : dt.getTime();
+};
+
+const getDirectTextContent = (el: Element): string => {
+  // spanなどの子要素を除き、直接のテキストノードだけ結合する
+  let text = "";
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) text += node.textContent ?? "";
+  }
+  return text.trim().replace(/\s+/g, " ");
+};
+
+const findCourseNameForRow = (row: Element): string => {
+  let el: Element | null = row;
+  while (el && el !== document.body) {
+    el = el.parentElement;
+    if (!el) break;
+    let prev: Element | null = el.previousElementSibling;
+    while (prev) {
+      const text = prev.textContent?.trim() ?? "";
+      if (/\d{6}/.test(text) && text.length < 300) {
+        // 6桁コードを含むリンクを探し、直接テキストノードだけ取得する
+        const links = Array.from(prev.querySelectorAll<HTMLAnchorElement>("a"));
+        const courseLink = links.find((a) => /\d{6}/.test(a.textContent ?? ""));
+        if (courseLink) {
+          const name = getDirectTextContent(courseLink);
+          if (name && /\d{6}/.test(name)) return name;
+        }
+        // フォールバック：全テキストから不要部分を除去
+        return text.replace(/\s+/g, " ").replace(/開講情報.*$/, "").replace(/Chevron.*?icon/gi, "").trim();
+      }
+      prev = prev.previousElementSibling;
+    }
+  }
+  return "不明";
+};
+
+const extractTasksFromDashboardDoc = (doc: Document): ExtractedTask[] => {
+  const tasks: ExtractedTask[] = [];
+  const seen = new Set<string>();
+  const deadlineCells = Array.from(doc.querySelectorAll<HTMLElement>('td[data-test="締切"]'));
+  for (const deadlineCell of deadlineCells) {
+    const row = deadlineCell.closest("tr");
+    if (!row) continue;
+    const titleTd = row.querySelector<HTMLElement>("td:not([data-test])");
+    const title = titleTd?.textContent?.trim() ?? "";
+    if (!title) continue;
+    const deadlineRaw = deadlineCell.textContent?.trim().replace(/\s+/g, " ") ?? "";
+    const endAtMs = parseDashboardDate(deadlineRaw);
+    const taskUrl = titleTd?.querySelector<HTMLAnchorElement>("a[href]")?.href ?? null;
+    const courseName = findCourseNameForRow(row);
+    const courseCode = extractCourseCode(courseName);
+    const taskKey = normalizeKey(`${courseCode ?? sanitizeForKey(courseName)}_${sanitizeForKey(title)}`);
+    if (seen.has(taskKey)) continue;
+    seen.add(taskKey);
+    tasks.push({ taskKey, course: courseName, title, endAtRaw: deadlineRaw || "期限なし", endAtMs, taskUrl, courseId: null, taskId: null, source: "WebClass_AutoSync" });
+  }
+  return tasks;
+};
+
+const findDashboardUrl = (): string | null => {
+  const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
+  const candidates = links.filter((a) => (a.textContent?.trim() ?? "").includes("ダッシュボード"));
+  console.log("[MTH] ダッシュボード候補:", candidates.map((a) => ({ text: a.textContent?.trim(), href: a.href })));
+  const link = candidates.find((a) => a.href.includes("acs_=")) ?? candidates[0] ?? null;
+  return link?.href ?? null;
+};
+
+const extractTasksFromDashboard = (dashboardUrl: string): Promise<ExtractedTask[]> =>
   new Promise((resolve) => {
     const iframe = document.createElement("iframe");
-    iframe.style.display = "none"; iframe.src = courseUrl; document.body.appendChild(iframe);
+    iframe.style.display = "none";
+    iframe.src = dashboardUrl;
+    document.body.appendChild(iframe);
     let attempts = 0;
-    const timeout = setTimeout(() => {
-      clearInterval(checkInterval); if (document.body.contains(iframe)) document.body.removeChild(iframe);
-      resolve([]);
-    }, 20000);
-    const checkInterval = setInterval(() => {
-      attempts += 1; const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!iframeDoc) return;
-      const elements = iframeDoc.querySelectorAll(".cl-contentsList_content");
-      // Proceed as soon as any content appears, or after a minimal wait.
-      if (attempts < 2 && elements.length === 0) return;
-      clearInterval(checkInterval); clearTimeout(timeout);
-      const tasks: ExtractedTask[] = Array.from(elements).filter((el) => isLikelyTaskItem(el)).map((el) => {
-        const text = el.textContent?.trim() || "", title = resolveTitle(el);
-        const taskUrl = el.querySelector<HTMLAnchorElement>("a[href]")?.href || null;
-        const courseId = extractQueryParam(courseUrl, "course_id") || extractQueryParam(courseUrl, "course") || null;
-        const taskId = (taskUrl && (extractQueryParam(taskUrl, "content_id") || extractQueryParam(taskUrl, "id"))) || null;
-        const dueInfo = extractDueInfo(text);
-        const taskKey = taskId ? normalizeKey(`${courseId || "course"}_${taskId}`) : normalizeKey(`${extractCourseCode(courseName) || courseName}_${sanitizeForKey(title)}`);
-        return { taskKey, course: courseName, title, endAtRaw: dueInfo.raw, endAtMs: dueInfo.ms, taskUrl, courseId, taskId, source: "WebClass_AutoSync" };
-      });
-      if (document.body.contains(iframe)) document.body.removeChild(iframe);
+    const cleanup = (tasks: ExtractedTask[]) => {
+      try { iframe.remove(); } catch { void 0; }
       resolve(tasks);
+    };
+    const check = setInterval(() => {
+      attempts++;
+      const doc = iframe.contentDocument;
+      if (!doc?.body) return;
+      const deadlineCount = doc.querySelectorAll('td[data-test="締切"]').length;
+      // 締切セルが見つかれば即確定。なければ最低4回(2秒)待ってからタイムアウト扱い
+      if (deadlineCount > 0 || attempts >= 30) {
+        clearInterval(check);
+        cleanup(extractTasksFromDashboardDoc(doc));
+      } else if (attempts >= 4 && doc.body.innerHTML.includes("登録されている教材がありません")) {
+        clearInterval(check);
+        cleanup([]);
+      }
     }, 500);
   });
-
-const resolveTimetableUrl = (): string | null => {
-  if (!location.href.includes("/webclass/")) return null;
-  const path = location.pathname.toLowerCase();
-  const search = location.search.toLowerCase();
-  if ((path === "/webclass/" || path === "/webclass") && search.includes("acs_=")) return location.href;
-  if (path.includes("/main/timetable") || search.includes("timetable")) return location.href;
-  const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
-  const timetableAnchor = anchors.find((anchor) => {
-    const text = anchor.textContent || "";
-    const href = anchor.href.toLowerCase();
-    return (text.includes("時間割") || href.includes("timetable")) && !href.includes("course.php");
-  });
-  if (timetableAnchor?.href) return timetableAnchor.href;
-  return `${location.origin}/webclass/`;
-};
-
-const touchPage = (url: string): Promise<void> =>
-  new Promise((resolve) => {
-    const iframe = document.createElement("iframe");
-    iframe.style.display = "none";
-    iframe.src = url;
-    document.body.appendChild(iframe);
-    const cleanup = () => {
-      try { iframe.remove(); } catch { void 0; }
-      resolve();
-    };
-    iframe.addEventListener("load", () => cleanup(), { once: true });
-    setTimeout(() => cleanup(), 2500);
-  });
-
-const logoutAndReturnToLogin = (): Promise<void> =>
-  new Promise((resolve) => {
-    const iframe = document.createElement("iframe");
-    iframe.style.display = "none";
-    iframe.src = "https://rpwebcls.meijo-u.ac.jp/webclass/logout.php?acs_=7a478e38";
-    document.body.appendChild(iframe);
-
-    const cleanup = () => {
-      try { iframe.remove(); } catch { void 0; }
-      resolve();
-    };
-
-    const tryClick = (): boolean => {
-      const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!doc) return false;
-      const candidates = Array.from(doc.querySelectorAll<HTMLElement>(
-        "button, input[type='button'], input[type='submit'], a"
-      ));
-      const target = candidates.find((el) => {
-        const text = (el.textContent || "").trim();
-        const value = (el instanceof HTMLInputElement ? el.value : "").trim();
-        return text.includes("ログイン画面に戻る") || value.includes("ログイン画面に戻る");
-      });
-      if (!target) return false;
-      target.click();
-      return true;
-    };
-
-    let tries = 0;
-    const interval = setInterval(() => {
-      tries += 1;
-      if (tryClick() || tries >= 12) {
-        clearInterval(interval);
-        setTimeout(() => cleanup(), 800);
-      }
-    }, 300);
-
-    setTimeout(() => {
-      clearInterval(interval);
-      cleanup();
-    }, 5000);
-  });
-
-const getUniqueCourseLinks = (): HTMLAnchorElement[] => {
-  const processed = new Set<string>();
-  return (Array.from(document.querySelectorAll("a[href*='course.php']")) as HTMLAnchorElement[]).filter(link => {
-    if (processed.has(link.href)) return false; processed.add(link.href); return true;
-  });
-};
 
 const setSyncButtonDisabled = (disabled: boolean) => {
   const syncBtn = ensurePanel().querySelector<HTMLButtonElement>("#mth-sync-btn");
@@ -535,7 +521,6 @@ const setSyncButtonDisabled = (disabled: boolean) => {
 
 const startAutoSync = async (manual = false) => {
   if (syncing) return;
-  const returnHref = resolveTimetableUrl() || location.href;
   const uid = await ensureSignedIn(manual);
   if (!uid) {
     updateStatus("ログインが必要です");
@@ -557,41 +542,65 @@ const startAutoSync = async (manual = false) => {
   syncing = true; ensurePanel(); setSyncButtonDisabled(true);
   updateStatus(manual ? "手動同期を開始しました" : "自動同期を開始しました");
   try {
-    const googlePromise = requestGoogleClassroomSync(manual), links = getUniqueCourseLinks();
-    if (links.length === 0) {
-      const dbTasks = await loadTasksFromDb(uid); lastTasks = dbTasks; renderTasks(lastTasks);
-      updateStatus(`科目未検出 / DBから${dbTasks.length}件表示 / ${await googlePromise || ""}`);
-      return;
-    }
+    const googlePromise = requestGoogleClassroomSync(manual);
     const allTasks: ExtractedTask[] = [];
-    for (let i = 0; i < links.length; i++) {
-      updateStatus(`[${i + 1}/${links.length}] ${links[i].textContent?.trim()} を解析中`);
-      try { allTasks.push(...await extractCourseTasks(links[i].href, links[i].textContent?.trim() || "不明")); } catch { void 0; }
+    // ダッシュボードページに既にいる場合は直接取得、そうでなければiframe経由
+    const onDashboard = document.querySelectorAll('td[data-test="締切"]').length > 0;
+    if (onDashboard) {
+      updateStatus("ダッシュボードから課題を取得中...");
+      allTasks.push(...extractTasksFromDashboardDoc(document));
+    } else {
+      const dashboardUrl = findDashboardUrl();
+      if (dashboardUrl) {
+        updateStatus("ダッシュボードから課題を取得中...");
+        allTasks.push(...await extractTasksFromDashboard(dashboardUrl));
+      } else {
+        const dbTasks = await loadTasksFromDb(uid); lastTasks = dbTasks; renderTasks(lastTasks);
+        updateStatus(`ダッシュボードが見つかりません / DBから${dbTasks.length}件表示`);
+        return;
+      }
     }
-    const deduped = Array.from(new Map(allTasks.map(t => [t.taskKey, t])).values());
+    const now = Date.now();
+    const deduped = Array.from(new Map(allTasks.map(t => [t.taskKey, t])).values())
+      .filter(t => t.endAtMs === null || t.endAtMs > now);
     console.log(`[MTH] upsert開始: ${deduped.length}件`);
-    for (const t of deduped) try { await upsertTask(uid, t); } catch (e) { console.error("❌ upsert失敗:", t.taskKey, e); }
-    console.log("[MTH] upsert完了、DB読込開始");
+    for (const t of deduped) {
+      try {
+        await upsertTask(uid, t);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes("Extension context invalidated")) {
+          updateStatus("拡張機能が更新されました。ページを再読み込みしてください");
+          return;
+        }
+        console.error("❌ upsert失敗:", t.taskKey, e);
+      }
+    }
+    console.log("[MTH] upsert完了、Classroom同期待機中");
+    const googleResult = await Promise.race([
+      googlePromise,
+      new Promise<string>((r) => setTimeout(() => r("Google Classroom: タイムアウト"), 25000)),
+    ]);
+    console.log("[MTH] DB読込開始");
     lastTasks = await loadTasksFromDb(uid); renderTasks(lastTasks);
     console.log(`[MTH] DB読込完了: ${lastTasks.length}件`);
-    updateStatus(`同期完了: ${deduped.length}件抽出 / ${await googlePromise || ""}`);
+    updateStatus(`同期完了: ${deduped.length}件抽出 / ${googleResult || ""}`);
     if (!manual) await writeStorageNumber(LAST_AUTO_SYNC_AT_KEY, Date.now());
-    if (returnHref.includes("/webclass/")) {
-      await touchPage(returnHref);
-    }
-    await logoutAndReturnToLogin();
   } finally { syncing = false; setSyncButtonDisabled(false); }
 };
 
 const requestGoogleClassroomSync = async (interactive: boolean): Promise<string | null> => {
   if (!extensionChrome?.runtime?.sendMessage) return null;
   try {
-    const res = await new Promise<GoogleSyncResponse | undefined>((r) =>
-      extensionChrome?.runtime?.sendMessage?.(
-        { type: "mth-sync-google-classroom", interactive },
-        (response) => r(response as GoogleSyncResponse | undefined)
-      )
-    );
+    const res = await Promise.race([
+      new Promise<GoogleSyncResponse | undefined>((r) =>
+        extensionChrome?.runtime?.sendMessage?.(
+          { type: "mth-sync-google-classroom", interactive },
+          (response) => r(response as GoogleSyncResponse | undefined)
+        )
+      ),
+      new Promise<undefined>((r) => setTimeout(() => r(undefined), 30000)),
+    ]);
     return res?.ok ? (res.message || "同期完了") : `Google Classroom失敗: ${res?.message || "不明"}`;
   } catch { return "Google Classroom同期に失敗"; }
 };
