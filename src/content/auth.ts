@@ -1,3 +1,4 @@
+import { apiLogin } from "./api";
 import { extensionChrome } from "./runtime";
 
 type AuthTokenResponse = {
@@ -8,8 +9,6 @@ type AuthTokenResponse = {
 
 let activeUid: string | null = null;
 let signInPromise: Promise<string | null> | null = null;
-
-const tokenToUid = (token: string): string => `google_${token.slice(0, 12)}`;
 
 const requestAuthToken = (interactive: boolean): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -35,8 +34,9 @@ export const ensureSignedIn = async (interactive: boolean): Promise<string | nul
   if (signInPromise) return signInPromise;
   signInPromise = (async () => {
     try {
-      const token = await requestAuthToken(interactive);
-      activeUid = tokenToUid(token);
+      const googleToken = await requestAuthToken(interactive);
+      const uid = await apiLogin(googleToken);
+      activeUid = uid;
       return activeUid;
     } catch (error) {
       console.error("❌ 認証に失敗:", error);

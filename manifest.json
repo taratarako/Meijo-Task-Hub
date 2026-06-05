@@ -7,10 +7,11 @@
     "host_permissions": [
         "https://rpwebcls.meijo-u.ac.jp/webclass/*",
         "https://classroom.googleapis.com/*",
-        "https://www.googleapis.com/*"
+        "https://www.googleapis.com/*",
+        "https://9tect2wfh8.execute-api.ap-northeast-1.amazonaws.com/*"
     ],
     "oauth2": {
-        "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+        "client_id": "876850937483-se96djmspafm9b360a966iig3f5un96p.apps.googleusercontent.com",
         "scopes": [
             "https://www.googleapis.com/auth/userinfo.email",
             "https://www.googleapis.com/auth/userinfo.profile",

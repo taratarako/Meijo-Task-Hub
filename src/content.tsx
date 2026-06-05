@@ -39,6 +39,7 @@ const isTargetTimetablePage = (): boolean => {
   const search = location.search.toLowerCase();
   const href = location.href.toLowerCase();
   if (path.includes("/main/timetable") || search.includes("timetable") || href.includes("/main/timetable")) return true;
+  if ((path === "/webclass/" || path === "/webclass") && search.includes("acs_=")) return true;
   const headingText = document.querySelector("h1")?.textContent || document.querySelector("h2")?.textContent || document.querySelector(".cl-pageTitle")?.textContent || "";
   if (headingText.includes("時間割")) return true;
   const breadcrumbText = document.querySelector(".breadcrumb")?.textContent || "";
@@ -446,22 +447,18 @@ const extractCourseTasks = (courseUrl: string, courseName: string): Promise<Extr
 
 const resolveTimetableUrl = (): string | null => {
   if (!location.href.includes("/webclass/")) return null;
-  const loginAnchor = document.querySelector<HTMLAnchorElement>(
-    "a[href*='/webclass/course.php/'][href*='login?acs='],a[href*='/webclass/course.php/'][href*='login?acs_']",
-  );
-  if (loginAnchor?.href) return loginAnchor.href;
+  const path = location.pathname.toLowerCase();
+  const search = location.search.toLowerCase();
+  if ((path === "/webclass/" || path === "/webclass") && search.includes("acs_=")) return location.href;
+  if (path.includes("/main/timetable") || search.includes("timetable")) return location.href;
   const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
   const timetableAnchor = anchors.find((anchor) => {
     const text = anchor.textContent || "";
     const href = anchor.href.toLowerCase();
-    return text.includes("時間割") || href.includes("timetable");
+    return (text.includes("時間割") || href.includes("timetable")) && !href.includes("course.php");
   });
   if (timetableAnchor?.href) return timetableAnchor.href;
-  const href = location.href.toLowerCase();
-  const path = location.pathname.toLowerCase();
-  const search = location.search.toLowerCase();
-  if (path.includes("/main/timetable") || search.includes("timetable") || href.includes("/main/timetable")) return location.href;
-  return `${location.origin}/webclass/main/timetable`;
+  return `${location.origin}/webclass/`;
 };
 
 const touchPage = (url: string): Promise<void> =>
@@ -572,8 +569,11 @@ const startAutoSync = async (manual = false) => {
       try { allTasks.push(...await extractCourseTasks(links[i].href, links[i].textContent?.trim() || "不明")); } catch { void 0; }
     }
     const deduped = Array.from(new Map(allTasks.map(t => [t.taskKey, t])).values());
-    for (const t of deduped) try { await upsertTask(uid, t); } catch { void 0; }
+    console.log(`[MTH] upsert開始: ${deduped.length}件`);
+    for (const t of deduped) try { await upsertTask(uid, t); } catch (e) { console.error("❌ upsert失敗:", t.taskKey, e); }
+    console.log("[MTH] upsert完了、DB読込開始");
     lastTasks = await loadTasksFromDb(uid); renderTasks(lastTasks);
+    console.log(`[MTH] DB読込完了: ${lastTasks.length}件`);
     updateStatus(`同期完了: ${deduped.length}件抽出 / ${await googlePromise || ""}`);
     if (!manual) await writeStorageNumber(LAST_AUTO_SYNC_AT_KEY, Date.now());
     if (returnHref.includes("/webclass/")) {

@@ -7,9 +7,10 @@ export const upsertTask = async (_uid: string, task: ExtractedTask) => {
 
 export const loadTasksFromDb = async (_uid: string, max = 120): Promise<ExtractedTask[]> => {
   const tasks = await apiGetTasks(true);
+  console.log(`[MTH] apiGetTasks結果: ${tasks?.length ?? "undefined"}件`);
   const now = Date.now();
   const toDelete: string[] = [];
-  const items = tasks.slice(0, max);
+  const items = (tasks ?? []).slice(0, max);
   const visible = items.filter((task) => {
     if (typeof task.endAtMs === "number" && task.endAtMs < now) {
       toDelete.push(task.taskKey);
@@ -24,6 +25,7 @@ export const loadTasksFromDb = async (_uid: string, max = 120): Promise<Extracte
     return true;
   });
   if (toDelete.length > 0) {
+    console.log(`[MTH] 期限切れタスク削除: ${toDelete.join(", ")}`);
     await Promise.all(toDelete.map((key) => apiDeleteTask(key)));
   }
   return Array.from(new Map(visible.map((task) => [task.taskKey, task])).values());

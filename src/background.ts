@@ -1,3 +1,9 @@
+import type { ExtractedTask } from "./content/types";
+
+const AWS_API_BASE = "https://9tect2wfh8.execute-api.ap-northeast-1.amazonaws.com/default/meijo-task-hub-api";
+
+let awsJwt: string | null = null;
+
 type GoogleCourse = {
 	id: string;
 	name: string;
@@ -76,6 +82,20 @@ type AddEventResponse = {
 	eventId?: string;
 };
 
+type ApiRequestMessage = {
+	type: "mth-api-request";
+	url: string;
+	method: string;
+	headers: Record<string, string>;
+	body: string | null;
+};
+
+type ApiRequestResponse = {
+	ok: boolean;
+	status: number;
+	body: string;
+};
+
 type ChromeIdentityApi = {
 	getAuthToken: (details: { interactive: boolean }, callback: (token?: string) => void) => void;
 };
@@ -102,13 +122,39 @@ const CLASSROOM_WORK_URL = (courseId: string) =>
 const CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
 const CALENDAR_EVENTS_URL = (calendarId: string) => `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
 
+const getAwsJwt = async (interactive: boolean, googleToken?: string): Promise<string> => {
+	if (awsJwt) return awsJwt;
+	const token = googleToken ?? await getAuthTokenInternal(interactive);
+	const response = await fetch(`${AWS_API_BASE}/auth/login`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ googleToken: token }),
+	});
+	if (!response.ok) throw new Error("AWS認証に失敗しました");
+	const data = await response.json() as { accessToken: string };
+	awsJwt = data.accessToken;
+	return awsJwt;
+};
+
+const upsertTasksToAws = async (tasks: ExtractedTask[], jwt: string): Promise<void> => {
+	const response = await fetch(`${AWS_API_BASE}/tasks/upsert`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"Authorization": `Bearer ${jwt}`,
+		},
+		body: JSON.stringify({ tasks, clientUpdatedAt: Date.now() }),
+	});
+	if (!response.ok) throw new Error(`タスク保存に失敗しました (${response.status})`);
+};
+
 const getIdentity = () => {
 	const identity = extensionChrome?.identity;
 	if (!identity) throw new Error("chrome.identity が利用できません");
 	return identity;
 };
 
-const getAuthToken = (interactive: boolean): Promise<string> =>
+const getAuthTokenInternal = (interactive: boolean): Promise<string> =>
 	new Promise((resolve, reject) => {
 		getIdentity().getAuthToken({ interactive }, (token) => {
 			const runtime = extensionChrome?.runtime;
@@ -181,20 +227,35 @@ const fetchCourseWork = async (token: string, course: GoogleCourse): Promise<Goo
 };
 
 const syncGoogleClassroom = async (interactive: boolean): Promise<SyncResponse> => {
-	const token = await getAuthToken(interactive);
+	const token = await getAuthTokenInternal(interactive);
+	const jwt = await getAwsJwt(interactive, token);
 	const courses = await fetchAllCourses(token);
-	let synced = 0;
+	const tasks: ExtractedTask[] = [];
 
 	for (const course of courses) {
 		const works = await fetchCourseWork(token, course);
 		for (const work of works) {
 			if (!work.id) continue;
-			void formatDueLabel(toDueMs(work));
-			synced += 1;
+			const endAtMs = toDueMs(work);
+			tasks.push({
+				taskKey: `classroom_${course.id}_${work.id}`,
+				course: course.name,
+				title: work.title || "無題",
+				endAtRaw: formatDueLabel(endAtMs),
+				endAtMs,
+				taskUrl: work.alternateLink || null,
+				courseId: course.id,
+				taskId: work.id,
+				source: "GoogleClassroom",
+			});
 		}
 	}
 
-	return { ok: true, message: `Google Classroom同期: ${synced}件 (保存なし)`, synced };
+	if (tasks.length > 0) {
+		await upsertTasksToAws(tasks, jwt);
+	}
+
+	return { ok: true, message: `Google Classroom同期: ${tasks.length}件`, synced: tasks.length };
 };
 
 const getCalendarsList = async (token: string): Promise<Calendar[]> => {
@@ -282,7 +343,7 @@ const createCalendarEvent = async (
 };
 
 extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, sendResponse: (response: unknown) => void) => {
-	const msg = message as SyncMessage | CalendarsMessage | AddEventMessage | AuthTokenMessage;
+	const msg = message as SyncMessage | CalendarsMessage | AddEventMessage | AuthTokenMessage | ApiRequestMessage;
 	
 	if (msg.type === "mth-sync-google-classroom") {
 		void syncGoogleClassroom(Boolean(msg.interactive))
@@ -297,7 +358,7 @@ extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, send
 	if (msg.type === "mth-get-calendars") {
 		void (async () => {
 			try {
-				const token = await getAuthToken(Boolean(msg.interactive));
+				const token = await getAuthTokenInternal(Boolean(msg.interactive));
 				const calendars = await getCalendarsList(token);
 				sendResponse({ ok: true, message: "カレンダー一覧取得成功", calendars } satisfies CalendarsResponse);
 			} catch (error) {
@@ -311,7 +372,7 @@ extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, send
 	if (msg.type === "mth-add-calendar-event") {
 		void (async () => {
 			try {
-				const token = await getAuthToken(Boolean(msg.interactive));
+				const token = await getAuthTokenInternal(Boolean(msg.interactive));
 				const exists = await checkEventExists(token, msg.calendarId, msg.task.taskKey);
 				if (exists) {
 					sendResponse({ ok: false, message: "このイベントは既に追加されています" } satisfies AddEventResponse);
@@ -330,11 +391,29 @@ extensionChrome?.runtime?.onMessage.addListener((message: unknown, _sender, send
 	if (msg.type === "mth-get-auth-token") {
 		void (async () => {
 			try {
-				const token = await getAuthToken(Boolean(msg.interactive));
+				const token = await getAuthTokenInternal(Boolean(msg.interactive));
 				sendResponse({ ok: true, token } satisfies AuthTokenResponse);
 			} catch (error) {
 				const messageText = error instanceof Error ? error.message : "認証トークン取得に失敗しました";
 				sendResponse({ ok: false, message: messageText } satisfies AuthTokenResponse);
+			}
+		})();
+		return true;
+	}
+
+	if (msg.type === "mth-api-request") {
+		void (async () => {
+			try {
+				const response = await fetch(msg.url, {
+					method: msg.method,
+					headers: msg.headers,
+					body: msg.body ?? undefined,
+				});
+				const body = await response.text();
+				sendResponse({ ok: response.ok, status: response.status, body } satisfies ApiRequestResponse);
+			} catch (error) {
+				const messageText = error instanceof Error ? error.message : "APIリクエストに失敗しました";
+				sendResponse({ ok: false, status: 0, body: JSON.stringify({ error: messageText }) } satisfies ApiRequestResponse);
 			}
 		})();
 		return true;

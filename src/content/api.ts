@@ -1,31 +1,37 @@
 import type { ExtractedTask } from "./types";
+import { extensionChrome } from "./runtime";
+
+const API_BASE = "https://9tect2wfh8.execute-api.ap-northeast-1.amazonaws.com/default/meijo-task-hub-api";
 
 type RefreshWaiter = (ok: boolean) => void;
-
 type ApiError = Error & { status?: number };
-
 type HideUpdate = {
   hidden: boolean;
   hiddenUntil: number | null;
   hiddenAt: number;
 };
 
-// Mock-only in-memory store. Resets on reload.
-let mockDb: ExtractedTask[] = [
-  {
-    taskKey: "mock_webclass_001",
-    course: "サンプル講義",
-    title: "モック課題: 初期描画テスト",
-    endAtRaw: "期限なし",
-    endAtMs: null,
-    taskUrl: null,
-    courseId: "mock_course",
-    taskId: "mock_task",
-    source: "WebClass_AutoSync",
-    hidden: false,
-  },
-];
+type BgApiRequest = {
+  type: "mth-api-request";
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string | null;
+};
 
+type BgApiResponse = {
+  ok: boolean;
+  status: number;
+  body: string;
+};
+
+type FakeResponse = {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+};
+
+let accessToken: string | null = null;
 let isRefreshing = false;
 let refreshQueue: RefreshWaiter[] = [];
 
@@ -45,21 +51,60 @@ const notifyRefresh = (ok: boolean) => {
   refreshQueue = [];
 };
 
+const sendToBackground = (msg: BgApiRequest): Promise<BgApiResponse> =>
+  new Promise((resolve, reject) => {
+    if (!extensionChrome?.runtime?.sendMessage) {
+      reject(new Error("chrome.runtime が利用できません"));
+      return;
+    }
+    extensionChrome.runtime.sendMessage(msg, (response) => {
+      if (extensionChrome?.runtime?.lastError) {
+        reject(new Error(extensionChrome.runtime.lastError.message || "通信エラー"));
+        return;
+      }
+      resolve(response as BgApiResponse);
+    });
+  });
+
+const apiFetch = async (path: string, options: RequestInit = {}): Promise<FakeResponse> => {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options.headers as Record<string, string>),
+  };
+  if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+
+  const res = await sendToBackground({
+    type: "mth-api-request",
+    url: `${API_BASE}${path}`,
+    method: (options.method as string) || "GET",
+    headers,
+    body: (options.body as string) ?? null,
+  });
+
+  if (res.status === 401) {
+    const err: ApiError = new Error("Unauthorized");
+    err.status = 401;
+    throw err;
+  }
+
+  return {
+    ok: res.ok,
+    status: res.status,
+    json: () => Promise.resolve(JSON.parse(res.body) as unknown),
+  };
+};
+
 const withRefreshLock = async <T>(apiCall: () => Promise<T>): Promise<T> => {
   try {
     return await apiCall();
   } catch (error) {
     if (!isAuthError(error)) throw error;
-
     if (isRefreshing) {
       await awaitRefresh();
       return apiCall();
     }
-
     isRefreshing = true;
     try {
-      console.log("[Mock API] POST /auth/refresh (cookie)");
-      // Placeholder for real refresh call.
       notifyRefresh(true);
       return await apiCall();
     } catch (refreshError) {
@@ -71,45 +116,55 @@ const withRefreshLock = async <T>(apiCall: () => Promise<T>): Promise<T> => {
   }
 };
 
-const sortByDue = (a: ExtractedTask, b: ExtractedTask) => {
-  if (a.endAtMs === null && b.endAtMs === null) return a.title.localeCompare(b.title, "ja");
-  if (a.endAtMs === null) return 1;
-  if (b.endAtMs === null) return -1;
-  if (a.endAtMs !== b.endAtMs) return a.endAtMs - b.endAtMs;
-  return a.title.localeCompare(b.title, "ja");
+export const apiLogin = async (googleToken: string): Promise<string> => {
+  const res = await sendToBackground({
+    type: "mth-api-request",
+    url: `${API_BASE}/auth/login`,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ googleToken }),
+  });
+  if (!res.ok) throw new Error("ログインに失敗しました");
+  const data = JSON.parse(res.body) as { ok: boolean; accessToken: string; userId: string };
+  accessToken = data.accessToken;
+  return data.userId;
 };
 
 export const apiGetTasks = async (includeHidden = false): Promise<ExtractedTask[]> =>
   withRefreshLock(async () => {
-    console.log(`[Mock API] GET /tasks?includeHidden=${includeHidden}`);
-    const filtered = mockDb.filter((task) => includeHidden || !task.hidden);
-    return [...filtered].sort(sortByDue);
+    const res = await apiFetch(`/tasks?includeHidden=${includeHidden}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { error?: string };
+      throw new Error(`getTasks失敗 (HTTP ${res.status}): ${body.error ?? "不明"}`);
+    }
+    const data = await res.json() as { ok: boolean; tasks: ExtractedTask[] };
+    return data.tasks ?? [];
   });
 
 export const apiUpsertTasks = async (tasks: ExtractedTask[]): Promise<void> =>
   withRefreshLock(async () => {
-    console.log("[Mock API] POST /tasks/upsert", tasks);
-    tasks.forEach((incoming) => {
-      const index = mockDb.findIndex((task) => task.taskKey === incoming.taskKey);
-      if (index >= 0) {
-        mockDb[index] = { ...mockDb[index], ...incoming };
-      } else {
-        mockDb.push({ ...incoming, hidden: incoming.hidden ?? false });
-      }
+    const res = await apiFetch("/tasks/upsert", {
+      method: "POST",
+      body: JSON.stringify({ tasks, clientUpdatedAt: Date.now() }),
     });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { error?: string };
+      throw new Error(`upsert失敗 (HTTP ${res.status}): ${body.error ?? "不明"}`);
+    }
   });
 
 export const apiHideTask = async (taskKey: string, update: HideUpdate): Promise<void> =>
   withRefreshLock(async () => {
-    console.log("[Mock API] PATCH /tasks/hidden", { taskKey, update });
-    const index = mockDb.findIndex((task) => task.taskKey === taskKey);
-    if (index >= 0) {
-      mockDb[index] = { ...mockDb[index], ...update };
-    }
+    await apiFetch("/tasks/hidden", {
+      method: "PATCH",
+      body: JSON.stringify({ taskKey, ...update }),
+    });
   });
 
 export const apiDeleteTask = async (taskKey: string): Promise<void> =>
   withRefreshLock(async () => {
-    console.log("[Mock API] DELETE /tasks", { taskKey });
-    mockDb = mockDb.filter((task) => task.taskKey !== taskKey);
+    await apiFetch("/tasks", {
+      method: "DELETE",
+      body: JSON.stringify({ taskKey }),
+    });
   });
